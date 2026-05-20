@@ -114,7 +114,8 @@ paths:
           $ref: "#/components/responses/NotFound"
     put:
       tags: [Products]
-      summary: Изменить товар
+      operationId: b2b_update_product
+      summary: Изменить товар (MODERATED/BLOCKED → ON_MODERATION + событие EDITED)
       requestBody:
         required: true
         content:
@@ -130,6 +131,12 @@ paths:
                 $ref: "#/components/schemas/Product"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Запрещено (HARD_BLOCKED, чужой seller)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -192,7 +199,8 @@ paths:
           format: uuid
     put:
       tags: [SKU]
-      summary: Изменить SKU по идентификатору
+      operationId: b2b_update_sku_by_id
+      summary: Изменить SKU по id (родитель MODERATED/BLOCKED → ON_MODERATION + EDITED)
       requestBody:
         required: true
         content:
@@ -208,6 +216,12 @@ paths:
                 $ref: "#/components/schemas/Sku"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Запрещено (HARD_BLOCKED, чужой seller)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           $ref: "#/components/responses/NotFound"
     delete:
