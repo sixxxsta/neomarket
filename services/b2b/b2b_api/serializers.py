@@ -1,6 +1,59 @@
+from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
+
+from django.utils.text import slugify
 from rest_framework import serializers
 
 from .models import Category, Invoice, InvoiceItem, Product, SellerProfile, Sku
+
+
+def _normalize_product_images(images):
+    normalized = []
+    for index, image in enumerate(images or []):
+        if not isinstance(image, dict):
+            continue
+        image_id = image.get('id')
+        if image_id:
+            normalized_id = str(image_id)
+        else:
+            url = image.get('url', '')
+            normalized_id = str(uuid5(NAMESPACE_URL, url)) if url else str(uuid4())
+        normalized.append({
+            'id': normalized_id,
+            'url': image.get('url', ''),
+            'ordering': image.get('ordering', index),
+        })
+    return normalized
+
+
+def _product_slug(product):
+    api_slug = getattr(product, '_api_slug', None)
+    if api_slug:
+        return api_slug
+    return slugify(product.title) or str(product.id)
+
+
+def _blocking_reason_id(product):
+    reason = product.blocking_reason
+    if not isinstance(reason, dict):
+        return None
+    raw = reason.get('id') or reason.get('blocking_reason_id')
+    if not raw:
+        return None
+    try:
+        return str(UUID(str(raw)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _moderator_comment(product):
+    reports = product.field_reports or []
+    messages = [report.get('message') for report in reports if isinstance(report, dict) and report.get('message')]
+    if messages:
+        return '; '.join(str(message) for message in messages)
+    reason = product.blocking_reason
+    if isinstance(reason, dict):
+        return reason.get('comment') or reason.get('message') or reason.get('title')
+    return None
 
 
 class CategorySerializer(serializers.ModelSerializer):
@@ -37,46 +90,50 @@ class CatalogSkuSerializer(serializers.ModelSerializer):
 
 
 class ProductSerializer(serializers.ModelSerializer):
-    category = CategorySerializer(read_only=True)
+    seller_id = serializers.UUIDField(read_only=True)
+    category_id = serializers.UUIDField(source='category_id', read_only=True)
+    slug = serializers.SerializerMethodField()
+    blocking_reason_id = serializers.SerializerMethodField()
+    moderator_comment = serializers.SerializerMethodField()
     skus = serializers.SerializerMethodField()
-    skus_count = serializers.SerializerMethodField()
-    total_active_quantity = serializers.SerializerMethodField()
 
     class Meta:
         model = Product
         fields = [
             'id',
+            'seller_id',
+            'category_id',
             'title',
+            'slug',
             'description',
             'status',
-            'category',
+            'deleted',
+            'blocking_reason_id',
+            'moderator_comment',
             'images',
             'characteristics',
             'skus',
-            'skus_count',
-            'total_active_quantity',
-            'blocking_reason',
-            'field_reports',
-            'deleted',
             'created_at',
             'updated_at',
         ]
+
+    def get_slug(self, obj):
+        return _product_slug(obj)
+
+    def get_blocking_reason_id(self, obj):
+        return _blocking_reason_id(obj)
+
+    def get_moderator_comment(self, obj):
+        return _moderator_comment(obj)
 
     def get_skus(self, obj):
         skus = [sku for sku in obj.skus.all() if not getattr(sku, 'deleted', False)]
         return SkuSerializer(skus, many=True).data
 
-    def get_skus_count(self, obj):
-        annotated = getattr(obj, 'skus_count', None)
-        if annotated is not None:
-            return int(annotated)
-        return obj.skus.filter(deleted=False).count()
-
-    def get_total_active_quantity(self, obj):
-        annotated = getattr(obj, 'total_active_quantity', None)
-        if annotated is not None:
-            return int(annotated or 0)
-        return sum(max(int(sku.active_quantity or 0), 0) for sku in obj.skus.filter(deleted=False))
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['images'] = _normalize_product_images(instance.images)
+        return data
 
 
 class CatalogProductSerializer(serializers.ModelSerializer):
@@ -105,16 +162,14 @@ class CatalogProductSerializer(serializers.ModelSerializer):
 
 class CreateProductRequestSerializer(serializers.Serializer):
     title = serializers.CharField(max_length=255)
-    description = serializers.CharField(required=False, allow_blank=True)
-    category_id = serializers.UUIDField(required=False)
-    category_name = serializers.CharField(max_length=255, required=False, allow_blank=False)
+    description = serializers.CharField(max_length=5000, allow_blank=False)
+    category_id = serializers.UUIDField()
+    slug = serializers.CharField(max_length=255, required=False, allow_null=True, allow_blank=True)
     images = serializers.ListField(child=serializers.DictField(), required=True)
     characteristics = serializers.ListField(child=serializers.DictField(), required=False)
 
     def validate(self, attrs):
-        if not attrs.get('category_id') and not attrs.get('category_name'):
-            raise serializers.ValidationError('Either category_id or category_name is required.')
-        if attrs.get('category_id') and not Category.objects.filter(id=attrs['category_id']).exists():
+        if not Category.objects.filter(id=attrs['category_id']).exists():
             raise serializers.ValidationError({'category_id': 'Unknown category_id.'})
         if not attrs.get('images'):
             raise serializers.ValidationError({'images': 'At least one image is required.'})
@@ -125,7 +180,6 @@ class UpdateProductRequestSerializer(serializers.Serializer):
     title = serializers.CharField(max_length=255, required=False)
     description = serializers.CharField(required=False, allow_blank=True)
     category_id = serializers.UUIDField(required=False)
-    category_name = serializers.CharField(max_length=255, required=False, allow_blank=False)
     images = serializers.ListField(child=serializers.DictField(), required=False)
     characteristics = serializers.ListField(child=serializers.DictField(), required=False)
 
