@@ -8,7 +8,7 @@ from django.db.models import Count, F, Q, Sum
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from jwt import InvalidTokenError
-from rest_framework import status
+from rest_framework import serializers, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -44,8 +44,26 @@ from .serializers import (
 )
 
 
+def _format_error_message(message):
+    if isinstance(message, str):
+        return message
+    if isinstance(message, dict):
+        parts = []
+        for field, errors in message.items():
+            if isinstance(errors, list):
+                for error in errors:
+                    if field in (serializers.NON_FIELD_ERRORS, '__all__'):
+                        parts.append(str(error))
+                    else:
+                        parts.append(f'{field}: {error}')
+            else:
+                parts.append(f'{field}: {errors}')
+        return '; '.join(parts) if parts else 'Validation failed.'
+    return str(message)
+
+
 def _error(code, message, http_status):
-    return Response({'code': code, 'message': message}, status=http_status)
+    return Response({'code': code, 'message': _format_error_message(message)}, status=http_status)
 
 
 def _parse_uuid(value):
@@ -84,8 +102,7 @@ def _decode_token(token):
 
 
 def _looks_like_seller_request(request):
-    auth_header = request.headers.get('Authorization', '')
-    return auth_header.startswith('Bearer ') or bool(request.headers.get('X-Seller-Id') or request.headers.get('X-User-Id'))
+    return request.headers.get('Authorization', '').startswith('Bearer ')
 
 
 def _get_seller_id(request):
@@ -101,9 +118,6 @@ def _get_seller_id(request):
             return seller_id, None
         return None, _error('UNAUTHORIZED', 'JWT does not contain seller id', status.HTTP_401_UNAUTHORIZED)
 
-    seller_id = _parse_uuid(request.headers.get('X-Seller-Id') or request.headers.get('X-User-Id'))
-    if seller_id:
-        return seller_id, None
     return None, _error('UNAUTHORIZED', 'Seller identity is required', status.HTTP_401_UNAUTHORIZED)
 
 
@@ -128,19 +142,6 @@ def _outbox_event(aggregate_id, event_type, payload):
         event_type=event_type,
         payload=payload,
     )
-
-
-def _resolve_category(validated_data):
-    category_id = validated_data.get('category_id')
-    category_name = (validated_data.get('category_name') or '').strip()
-
-    if category_id:
-        return Category.objects.filter(id=category_id).first()
-
-    existing = Category.objects.filter(name__iexact=category_name).first()
-    if existing:
-        return existing
-    return Category.objects.create(name=category_name)
 
 
 def _get_or_create_profile(seller_id):
@@ -482,18 +483,18 @@ class ProductsView(APIView):
         if not serializer.is_valid():
             return _error('BAD_REQUEST', serializer.errors, status.HTTP_400_BAD_REQUEST)
 
-        category = _resolve_category(serializer.validated_data)
-        if category is None:
-            return _error('BAD_REQUEST', {'category_id': ['Unknown category_id.']}, status.HTTP_400_BAD_REQUEST)
-
+        category = Category.objects.get(id=serializer.validated_data['category_id'])
         product = Product.objects.create(
             seller_id=seller_id,
             title=serializer.validated_data['title'],
-            description=serializer.validated_data.get('description', ''),
+            description=serializer.validated_data['description'],
             category=category,
             images=serializer.validated_data.get('images', []),
             characteristics=serializer.validated_data.get('characteristics', []),
         )
+        slug = serializer.validated_data.get('slug')
+        if slug:
+            product._api_slug = slug
         _send_product_event(product, 'PRODUCT_CREATED', 'CREATED')
         return Response(ProductSerializer(product).data, status=status.HTTP_201_CREATED)
 
@@ -568,10 +569,10 @@ class ProductDetailView(APIView):
         snapshot_before = _serialize_product_snapshot(product)
         previous_status = product.status
 
-        if 'category_id' in serializer.validated_data or 'category_name' in serializer.validated_data:
-            category = _resolve_category(serializer.validated_data)
+        if 'category_id' in serializer.validated_data:
+            category = Category.objects.filter(id=serializer.validated_data['category_id']).first()
             if category is None:
-                return _error('BAD_REQUEST', {'category_id': ['Unknown category_id.']}, status.HTTP_400_BAD_REQUEST)
+                return _error('BAD_REQUEST', 'Unknown category_id.', status.HTTP_400_BAD_REQUEST)
             product.category = category
 
         for field in ['title', 'description', 'images', 'characteristics']:
