@@ -14,8 +14,8 @@ class B2BApiTests(TestCase):
         self.client = APIClient()
         self.seller_id = uuid.uuid4()
         self.other_seller_id = uuid.uuid4()
-        self.headers = {'HTTP_X_SELLER_ID': str(self.seller_id)}
-        self.other_headers = {'HTTP_X_SELLER_ID': str(self.other_seller_id)}
+        self.headers = self.jwt_headers()
+        self.other_headers = self.jwt_headers(self.other_seller_id)
         self.service_headers = {'HTTP_X_SERVICE_KEY': 'neomarket-internal-key'}
         self.category = Category.objects.create(name='Electronics')
 
@@ -74,10 +74,8 @@ class B2BApiTests(TestCase):
     def _assert_bad_request_field(self, response, field):
         self.assertEqual(response.status_code, 400)
         message = response.data.get('message', response.data)
-        if isinstance(message, dict):
-            self.assertIn(field, message)
-            return
-        self.assertIn(field, str(message).lower())
+        self.assertIsInstance(message, str)
+        self.assertIn(field, message.lower())
 
     def test_create_product_returns_201_with_created_status(self):
         response = self.create_product_via_api(title='Canonical product')
@@ -85,10 +83,53 @@ class B2BApiTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.data['status'], Product.Status.CREATED)
         self.assertEqual(response.data['skus'], [])
+        self.assertEqual(str(response.data['seller_id']), str(self.seller_id))
+        self.assertEqual(str(response.data['category_id']), str(self.category.id))
+        self.assertTrue(response.data['slug'])
+        self.assertIsNone(response.data['blocking_reason_id'])
+        self.assertIsNone(response.data['moderator_comment'])
+        for image in response.data['images']:
+            self.assertIn('id', image)
+            self.assertIn('url', image)
+            self.assertIn('ordering', image)
 
         product = Product.objects.get(id=response.data['id'])
         self.assertEqual(product.status, Product.Status.CREATED)
         self.assertEqual(product.skus.count(), 0)
+
+        created_event = IntegrationOutbox.objects.filter(
+            aggregate_id=product.id,
+            event_type='PRODUCT_CREATED',
+        ).first()
+        self.assertIsNotNone(created_event)
+
+    def test_create_product_requires_jwt(self):
+        response = self.client.post(
+            '/api/v1/products',
+            {
+                'title': 'No auth product',
+                'description': 'missing jwt',
+                'category_id': str(self.category.id),
+                'images': [{'url': 'https://example.com/no-auth.jpg'}],
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.data['code'], 'UNAUTHORIZED')
+
+    def test_validation_error_message_is_string(self):
+        response = self.client.post(
+            '/api/v1/products',
+            {
+                'title': 'Bad payload',
+                'description': 'missing images',
+                'category_id': str(self.category.id),
+            },
+            format='json',
+            **self.headers,
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIsInstance(response.data['message'], str)
 
     def test_seller_id_taken_from_jwt(self):
         foreign_seller_id = uuid.uuid4()
@@ -133,11 +174,8 @@ class B2BApiTests(TestCase):
         )
         self.assertEqual(response.status_code, 400)
         message = response.data.get('message', response.data)
-        message_text = str(message).lower()
-        if isinstance(message, dict):
-            self.assertTrue('category_id' in message or 'category_name' in message or 'category' in message_text)
-        else:
-            self.assertIn('category', message_text)
+        self.assertIsInstance(message, str)
+        self.assertIn('category_id', message.lower())
 
     def test_invalid_category_id_returns_400(self):
         response = self.client.post(
