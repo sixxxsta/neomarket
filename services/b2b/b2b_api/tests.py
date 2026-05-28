@@ -191,66 +191,100 @@ class B2BApiTests(TestCase):
         )
         self._assert_bad_request_field(response, 'category_id')
 
-    def test_missing_image_returns_400_for_sku_create(self):
-        product = self.create_product()
-        response = self.client.post(
-            '/api/v1/skus',
-            {
-                'product_id': str(product.id),
-                'name': 'No image SKU',
-                'price': 500,
-                'cost_price': 300,
-                'active_quantity': 1,
-            },
-            format='json',
-            **self.headers,
-        )
-        self.assertEqual(response.status_code, 400)
+    def _post_sku(self, product_id, **extra):
+        payload = {
+            'product_id': str(product_id),
+            'name': 'SKU',
+            'price': 100,
+            'cost_price': 60,
+            'active_quantity': 2,
+            'images': [{'url': 'https://example.com/sku.jpg'}],
+        }
+        payload.update(extra)
+        return self.client.post('/api/v1/skus', payload, format='json', **self.headers)
 
-    def test_first_sku_moves_product_to_on_moderation_and_second_does_not_change_state(self):
+    def test_missing_image_returns_400(self):
+        product = self.create_product()
+        response = self._post_sku(product.id, images=[])
+        self.assertEqual(response.status_code, 400)
+        self._assert_bad_request_field(response, 'images')
+
+    def test_first_sku_transitions_product_to_on_moderation(self):
         created = self.create_product_via_api()
         self.assertEqual(created.status_code, 201)
 
-        first_sku = self.client.post(
-            '/api/v1/skus',
-            {
-                'product_id': created.data['id'],
-                'name': 'SKU 1',
-                'price': 100,
-                'cost_price': 60,
-                'active_quantity': 2,
-                'images': [{'url': 'https://example.com/sku-1.jpg'}],
-            },
-            format='json',
-            **self.headers,
+        response = self._post_sku(
+            created.data['id'],
+            name='SKU 1',
+            images=[{'url': 'https://example.com/sku-1.jpg'}],
         )
-        self.assertEqual(first_sku.status_code, 201)
+        self.assertEqual(response.status_code, 201)
 
         product = Product.objects.get(id=created.data['id'])
         self.assertEqual(product.status, Product.Status.ON_MODERATION)
-        moderation_events = IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_UPDATED')
-        self.assertEqual(moderation_events.count(), 1)
-        self.assertEqual(moderation_events.first().payload['event_type'], 'CREATED')
-        self.assertEqual(len(moderation_events.first().payload['snapshot_after']['skus']), 1)
-        self.assertEqual(moderation_events.first().payload['snapshot_after']['skus'][0]['id'], str(first_sku.data['id']))
 
-        second_sku = self.client.post(
-            '/api/v1/skus',
-            {
-                'product_id': created.data['id'],
-                'name': 'SKU 2',
-                'price': 120,
-                'cost_price': 80,
-                'active_quantity': 1,
-                'images': [{'url': 'https://example.com/sku-2.jpg'}],
-            },
-            format='json',
-            **self.headers,
+    def test_first_sku_emits_created_event_to_moderation(self):
+        created = self.create_product_via_api()
+        response = self._post_sku(
+            created.data['id'],
+            name='SKU 1',
+            price=100,
+            images=[{'url': 'https://example.com/sku-1.jpg'}],
         )
-        self.assertEqual(second_sku.status_code, 201)
+        self.assertEqual(response.status_code, 201)
+
+        product = Product.objects.get(id=created.data['id'])
+        events = IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_UPDATED')
+        self.assertEqual(events.count(), 1)
+
+        payload = events.first().payload
+        self.assertEqual(payload['event_type'], 'CREATED')
+        self.assertEqual(payload['product_id'], str(product.id))
+        self.assertTrue(payload.get('idempotency_key'))
+        self.assertEqual(payload['snapshot_before']['status'], Product.Status.CREATED)
+        self.assertEqual(payload['snapshot_after']['status'], Product.Status.ON_MODERATION)
+        self.assertEqual(len(payload['snapshot_after']['skus']), 1)
+        sku_snapshot = payload['snapshot_after']['skus'][0]
+        self.assertEqual(sku_snapshot['id'], str(response.data['id']))
+        self.assertEqual(sku_snapshot['name'], 'SKU 1')
+        self.assertEqual(sku_snapshot['price'], 100)
+        self.assertEqual(sku_snapshot['images'][0]['url'], 'https://example.com/sku-1.jpg')
+
+    def test_second_sku_no_state_change(self):
+        created = self.create_product_via_api()
+        first = self._post_sku(created.data['id'], name='SKU 1', images=[{'url': 'https://example.com/sku-1.jpg'}])
+        self.assertEqual(first.status_code, 201)
+
+        product = Product.objects.get(id=created.data['id'])
+        self.assertEqual(product.status, Product.Status.ON_MODERATION)
+        events_before = IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_UPDATED').count()
+
+        second = self._post_sku(
+            created.data['id'],
+            name='SKU 2',
+            price=120,
+            images=[{'url': 'https://example.com/sku-2.jpg'}],
+        )
+        self.assertEqual(second.status_code, 201)
+
         product.refresh_from_db()
         self.assertEqual(product.status, Product.Status.ON_MODERATION)
-        self.assertEqual(IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_UPDATED').count(), 1)
+        self.assertEqual(
+            IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_UPDATED').count(),
+            events_before,
+        )
+
+    def test_add_sku_to_hard_blocked_returns_403(self):
+        product = self.create_product(status=Product.Status.HARD_BLOCKED)
+        response = self._post_sku(product.id, name='Blocked SKU')
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data['code'], 'FORBIDDEN')
+        product.refresh_from_db()
+        self.assertEqual(product.status, Product.Status.HARD_BLOCKED)
+        self.assertEqual(product.skus.filter(deleted=False).count(), 0)
+        self.assertFalse(
+            IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_UPDATED').exists()
+        )
 
     def test_soft_delete_marks_product_and_keeps_deleted_in_seller_list(self):
         product = self.create_product(status=Product.Status.MODERATED)
