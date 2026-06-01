@@ -2,6 +2,7 @@ import uuid
 import json
 import urllib.error
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 from django.test import TestCase
 from rest_framework.test import APIClient
@@ -183,8 +184,20 @@ class CatalogApiTests(TestCase):
                     "items": [
                         {
                             "id": str(self.product.id),
+                            "title": self.product.title,
+                            "status": "MODERATED",
+                            "deleted": False,
+                            "category_id": str(self.category.id),
+                            "skus": [
+                                {
+                                    "id": str(self.product.skus.first().id),
+                                    "price": 12999000,
+                                    "active_quantity": 7,
+                                    "characteristics": [{"name": "color", "value": "black"}],
+                                }
+                            ],
                             "characteristics": [{"name": "brand", "value": "Neo"}],
-                            "skus": [{"characteristics": [{"name": "color", "value": "black"}]}],
+                            "rating": 5,
                         }
                     ],
                 }
@@ -212,7 +225,23 @@ class CatalogApiTests(TestCase):
                     "total_count": 1,
                     "limit": 20,
                     "offset": 0,
-                    "items": [{"id": str(self.product.id), "skus": [{"id": str(self.product.skus.first().id)}]}],
+                    "items": [
+                        {
+                            "id": str(self.product.id),
+                            "title": self.product.title,
+                            "status": "MODERATED",
+                            "deleted": False,
+                            "category_id": str(self.category.id),
+                            "characteristics": [{"name": "brand", "value": "Neo"}],
+                            "skus": [
+                                {
+                                    "id": str(self.product.skus.first().id),
+                                    "price": 12999000,
+                                    "active_quantity": 7,
+                                }
+                            ],
+                        }
+                    ],
                 }
             ).encode()
             response = self.client.get("/api/v1/products", {"ids": str(self.product.id)})
@@ -229,7 +258,23 @@ class CatalogApiTests(TestCase):
                     "total_count": 1,
                     "limit": 20,
                     "offset": 0,
-                    "items": [{"id": str(self.product.id), "skus": [{"id": str(sku.id)}]}],
+                    "items": [
+                        {
+                            "id": str(self.product.id),
+                            "title": self.product.title,
+                            "status": "MODERATED",
+                            "deleted": False,
+                            "category_id": str(self.category.id),
+                            "characteristics": [{"name": "brand", "value": "Neo"}],
+                            "skus": [
+                                {
+                                    "id": str(sku.id),
+                                    "price": 12999000,
+                                    "active_quantity": 7,
+                                }
+                            ],
+                        }
+                    ],
                 }
             ).encode()
             response = self.client.get("/api/v1/products", {"sku_ids": str(sku.id)})
@@ -252,6 +297,27 @@ class CatalogFlowDoDTests(TestCase):
         }
         return json.dumps(payload).encode()
 
+    def _visible_item(self, title, price, brand, *, category_id=None, active_quantity=1, deleted=False, status="MODERATED", sku_id=None, sku_characteristics=None, rating=0, popularity=0, discount=0):
+        return {
+            "id": str(uuid.uuid4()),
+            "title": title,
+            "status": status,
+            "deleted": deleted,
+            "category_id": str(category_id or self.category_id),
+            "characteristics": [{"name": "brand", "value": brand}],
+            "skus": [
+                {
+                    "id": str(sku_id or uuid.uuid4()),
+                    "price": price,
+                    "active_quantity": active_quantity,
+                    "characteristics": sku_characteristics or [],
+                }
+            ],
+            "rating": rating,
+            "popularity": popularity,
+            "discount": discount,
+        }
+
     def test_invalid_sort_returns_400(self):
         response = self.client.get("/api/v1/products", {"sort": "nope"})
         self.assertEqual(response.status_code, 400)
@@ -266,8 +332,11 @@ class CatalogFlowDoDTests(TestCase):
 
     def test_catalog_returns_filtered_sorted_products(self):
         items = [
-            {"id": str(uuid.uuid4()), "title": "Cheaper", "min_price": 1000},
-            {"id": str(uuid.uuid4()), "title": "Expensive", "min_price": 5000},
+            self._visible_item("Cheaper", 1000, "Apple", rating=4),
+            self._visible_item("Hidden draft", 200, "Apple", status="CREATED"),
+            self._visible_item("Hidden out of stock", 300, "Apple", active_quantity=0),
+            self._visible_item("Expensive", 5000, "Apple", rating=5),
+            self._visible_item("Wrong brand", 2500, "Samsung"),
         ]
         with patch("urllib.request.urlopen") as mocked:
             mocked.return_value.__enter__.return_value.read.return_value = self._mock_b2b_payload(items)
@@ -282,24 +351,22 @@ class CatalogFlowDoDTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["total_count"], 2)
         self.assertEqual(response.data["items"][0]["title"], "Cheaper")
+        self.assertEqual(response.data["items"][1]["title"], "Expensive")
+
+        request = mocked.call_args[0][0]
+        parsed_query = parse_qs(urlparse(request.full_url).query)
+        self.assertEqual(parsed_query["status"], ["MODERATED"])
+        self.assertEqual(parsed_query["deleted"], ["false"])
+        self.assertEqual(parsed_query["active_quantity__gt"], ["0"])
+        headers = {name.lower(): value for name, value in request.header_items()}
+        self.assertEqual(headers["x-service-key"], "neomarket-internal-key")
 
     def test_facets_return_counts_per_filter_value(self):
         items = [
-            {
-                "id": str(uuid.uuid4()),
-                "characteristics": [{"name": "brand", "value": "Apple"}],
-                "skus": [{"characteristics": [{"name": "color", "value": "Black"}]}],
-            },
-            {
-                "id": str(uuid.uuid4()),
-                "characteristics": [{"name": "brand", "value": "Apple"}],
-                "skus": [{"characteristics": [{"name": "color", "value": "White"}]}],
-            },
-            {
-                "id": str(uuid.uuid4()),
-                "characteristics": [{"name": "brand", "value": "Samsung"}],
-                "skus": [{"characteristics": [{"name": "color", "value": "Black"}]}],
-            },
+            self._visible_item("Apple Black 1", 1000, "Apple", sku_characteristics=[{"name": "color", "value": "Black"}], rating=4),
+            self._visible_item("Apple White", 1500, "Apple", sku_characteristics=[{"name": "color", "value": "White"}], rating=3),
+            self._visible_item("Samsung Black", 2000, "Samsung", sku_characteristics=[{"name": "color", "value": "Black"}], rating=5),
+            self._visible_item("Ignored draft", 500, "Apple", status="CREATED", sku_characteristics=[{"name": "color", "value": "Black"}]),
         ]
         with patch("urllib.request.urlopen") as mocked:
             mocked.return_value.__enter__.return_value.read.return_value = self._mock_b2b_payload(
@@ -309,5 +376,8 @@ class CatalogFlowDoDTests(TestCase):
         self.assertEqual(response.status_code, 200)
         facets = {facet["name"]: facet["values"] for facet in response.data["facets"]}
         brand_counts = {item["value"]: item["count"] for item in facets["brand"]}
+        color_counts = {item["value"]: item["count"] for item in facets["color"]}
         self.assertEqual(brand_counts["Apple"], 2)
         self.assertEqual(brand_counts["Samsung"], 1)
+        self.assertEqual(color_counts["Black"], 2)
+        self.assertEqual(color_counts["White"], 1)

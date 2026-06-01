@@ -1,6 +1,7 @@
 import random
 import re
 import json
+from datetime import datetime
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -77,6 +78,16 @@ def _parse_filters(query_params):
     return filters
 
 
+def _catalog_b2b_query(request, limit, offset):
+    query = dict(request.query_params)
+    query["limit"] = limit
+    query["offset"] = offset
+    query["status"] = Product.Status.MODERATED
+    query["deleted"] = "false"
+    query["active_quantity__gt"] = 0
+    return query
+
+
 def _b2b_request_url(path: str, query: dict) -> str:
     base = str(getattr(settings, "B2B_PRODUCTS_URL", "")).rstrip("/")
     if not base:
@@ -125,6 +136,274 @@ def _fetch_b2b_all_products(query: dict):
         offset += limit
 
     return items, None
+
+
+def _is_truthy(value):
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _item_category_id(item):
+    if not isinstance(item, dict):
+        return None
+    category = item.get("category") or {}
+    if isinstance(category, dict) and category.get("id"):
+        return str(category.get("id"))
+    if item.get("category_id"):
+        return str(item.get("category_id"))
+    return None
+
+
+def _item_status(item):
+    if not isinstance(item, dict):
+        return None
+    return str(item.get("status") or "")
+
+
+def _item_is_deleted(item):
+    if not isinstance(item, dict):
+        return True
+    return _is_truthy(item.get("deleted", False))
+
+
+def _item_active_quantity(item):
+    if not isinstance(item, dict):
+        return 0
+    if item.get("active_quantity") is not None:
+        try:
+            return int(item.get("active_quantity") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    total = 0
+    for sku in item.get("skus") or []:
+        if not isinstance(sku, dict):
+            continue
+        try:
+            total += int(sku.get("active_quantity") or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _item_price_bounds(item):
+    prices = []
+    if not isinstance(item, dict):
+        return 0, 0
+
+    for key in ("min_price", "price"):
+        if item.get(key) is not None:
+            try:
+                prices.append(int(item.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
+
+    for sku in item.get("skus") or []:
+        if not isinstance(sku, dict):
+            continue
+        try:
+            prices.append(int(sku.get("price") or 0))
+        except (TypeError, ValueError):
+            continue
+
+    if not prices:
+        return 0, 0
+    return min(prices), max(prices)
+
+
+def _item_timestamp(item):
+    if not isinstance(item, dict):
+        return 0.0
+    raw_value = item.get("created_at") or item.get("updated_at")
+    if isinstance(raw_value, datetime):
+        return raw_value.timestamp()
+    if not raw_value:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(str(raw_value).replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    return parsed.timestamp()
+
+
+def _item_attribute_map(item):
+    values = defaultdict(set)
+    if not isinstance(item, dict):
+        return values
+
+    for characteristic in item.get("characteristics") or []:
+        if not isinstance(characteristic, dict):
+            continue
+        slug = _normalize_filter_slug(characteristic.get("name") or "")
+        value = str(characteristic.get("value") or "").strip()
+        if slug and value:
+            values[slug].add(value)
+
+    for sku in item.get("skus") or []:
+        if not isinstance(sku, dict):
+            continue
+        for characteristic in sku.get("characteristics") or []:
+            if not isinstance(characteristic, dict):
+                continue
+            slug = _normalize_filter_slug(characteristic.get("name") or "")
+            value = str(characteristic.get("value") or "").strip()
+            if slug and value:
+                values[slug].add(value)
+
+    return values
+
+
+def _item_matches_identity_filters(item, ids=None, sku_ids=None):
+    if ids and str(item.get("id") or "") not in ids:
+        return False
+    if sku_ids:
+        item_sku_ids = {str(sku.get("id") or "") for sku in item.get("skus") or [] if isinstance(sku, dict)}
+        if not item_sku_ids.intersection(sku_ids):
+            return False
+    return True
+
+
+def _item_matches_filters(item, category_id=None, filters=None, search=None):
+    if _item_status(item) != Product.Status.MODERATED:
+        return False
+    if _item_is_deleted(item):
+        return False
+    if _item_active_quantity(item) <= 0:
+        return False
+
+    if category_id and _item_category_id(item) != str(category_id):
+        return False
+
+    if search:
+        haystack = " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("name") or ""),
+                str(item.get("description") or ""),
+            ]
+        ).lower()
+        if str(search).lower() not in haystack:
+            return False
+
+    attributes = _item_attribute_map(item)
+    filters = filters or {}
+    for slug, raw_value in filters.items():
+        if slug == "availability":
+            if _is_truthy(raw_value) and _item_active_quantity(item) <= 0:
+                return False
+            continue
+
+        if slug == "price" and isinstance(raw_value, dict):
+            min_price = _parse_int(raw_value.get("min"), default=None)
+            max_price = _parse_int(raw_value.get("max"), default=None)
+            item_min, item_max = _item_price_bounds(item)
+            if min_price is not None and item_max < min_price:
+                return False
+            if max_price is not None and item_min > max_price:
+                return False
+            continue
+
+        requested_values = raw_value if isinstance(raw_value, list) else str(raw_value).split(",")
+        requested_values = [str(value).strip() for value in requested_values if str(value).strip()]
+        if not requested_values:
+            continue
+
+        if not attributes.get(slug, set()).intersection(requested_values):
+            return False
+
+    return True
+
+
+def _sort_catalog_items(items, sort):
+    if sort == "price_asc":
+        return sorted(items, key=lambda item: (_item_price_bounds(item)[0], _item_timestamp(item), str(item.get("id") or "")))
+    if sort == "price_desc":
+        return sorted(items, key=lambda item: (_item_price_bounds(item)[1], _item_timestamp(item), str(item.get("id") or "")), reverse=True)
+    if sort == "discount_desc":
+        return sorted(items, key=lambda item: (int(item.get("discount") or 0), _item_timestamp(item), str(item.get("id") or "")), reverse=True)
+    if sort == "rating":
+        return sorted(items, key=lambda item: (float(item.get("rating") or 0), _item_timestamp(item), str(item.get("id") or "")), reverse=True)
+    if sort == "popularity":
+        return sorted(items, key=lambda item: (int(item.get("popularity") or 0), _item_timestamp(item), str(item.get("id") or "")), reverse=True)
+    return sorted(items, key=lambda item: (_item_timestamp(item), str(item.get("id") or "")), reverse=True)
+
+
+def _catalog_filtered_sorted_items(request):
+    limit = _parse_int(request.query_params.get("limit", 20), default=20, minimum=1, maximum=100)
+    offset = _parse_int(request.query_params.get("offset", 0), default=0, minimum=0)
+    sort = request.query_params.get("sort", "rating")
+    if sort not in ALLOWED_SORTS:
+        allowed = ", ".join(sorted(ALLOWED_SORTS))
+        return None, _error("INVALID_REQUEST", f"Invalid sort parameter. Allowed: {allowed}", status.HTTP_400_BAD_REQUEST)
+
+    category_id = request.query_params.get("category_id")
+    if category_id and not _is_uuid(category_id):
+        return None, _error("INVALID_REQUEST", "Invalid category_id", status.HTTP_400_BAD_REQUEST)
+
+    search = request.query_params.get("search")
+    if search is not None:
+        search = str(search).strip()
+        if search and len(search) < 3:
+            return None, _error("INVALID_REQUEST", "Search query must be at least 3 characters", status.HTTP_400_BAD_REQUEST)
+
+    ids_param = request.query_params.get("ids")
+    sku_ids_param = request.query_params.get("sku_ids")
+    ids = None
+    sku_ids = None
+    if ids_param:
+        ids = [item.strip() for item in str(ids_param).split(",") if item.strip()]
+        if any(not _is_uuid(item) for item in ids):
+            return None, _error("INVALID_REQUEST", "Invalid ids filter", status.HTTP_400_BAD_REQUEST)
+    if sku_ids_param:
+        sku_ids = [item.strip() for item in str(sku_ids_param).split(",") if item.strip()]
+        if any(not _is_uuid(item) for item in sku_ids):
+            return None, _error("INVALID_REQUEST", "Invalid sku_ids filter", status.HTTP_400_BAD_REQUEST)
+
+    query = _catalog_b2b_query(request, limit=200, offset=0)
+    items, error = _fetch_b2b_all_products(query)
+    if error:
+        return None, error
+
+    filters = _parse_filters(request.query_params)
+    filtered_items = [
+        item
+        for item in items
+        if _item_matches_identity_filters(item, ids=ids, sku_ids=sku_ids)
+        and _item_matches_filters(item, category_id=category_id, filters=filters, search=search)
+    ]
+    sorted_items = _sort_catalog_items(filtered_items, sort)
+
+    return {
+        "items": sorted_items,
+        "total_count": len(sorted_items),
+        "limit": limit,
+        "offset": offset,
+    }, None
+
+
+def _catalog_response_items(request):
+    payload, error = _catalog_filtered_sorted_items(request)
+    if error:
+        return None, error
+
+    limit = payload["limit"]
+    offset = payload["offset"]
+    items = payload["items"]
+    total_count = payload["total_count"]
+
+    return {
+        "items": items[offset : offset + limit],
+        "total_count": total_count,
+        "total": total_count,
+        "limit": limit,
+        "offset": offset,
+    }, None
+
+
+def _catalog_filtered_items(request):
+    payload, error = _catalog_filtered_sorted_items(request)
+    if error:
+        return None, error
+    return payload["items"], None
 
 
 def _base_products_queryset():
@@ -224,24 +503,7 @@ def _category_url(chain, current):
 )
 class ProductListView(APIView):
     def get(self, request):
-        limit = _parse_int(request.query_params.get("limit", 20), default=20, minimum=1, maximum=100)
-        offset = _parse_int(request.query_params.get("offset", 0), default=0, minimum=0)
-        sort = request.query_params.get("sort", "rating")
-        if sort not in ALLOWED_SORTS:
-            allowed = ", ".join(sorted(ALLOWED_SORTS))
-            return _error("INVALID_REQUEST", f"Invalid sort parameter. Allowed: {allowed}", status.HTTP_400_BAD_REQUEST)
-
-        search = request.query_params.get("search")
-        if search is not None:
-            search = str(search).strip()
-            if search and len(search) < 3:
-                return _error("INVALID_REQUEST", "Search query must be at least 3 characters", status.HTTP_400_BAD_REQUEST)
-
-        # B2C catalog proxies to B2B public feed; B2B enforces visibility rules.
-        query = dict(request.query_params)
-        query["limit"] = limit
-        query["offset"] = offset
-        payload, error = _fetch_b2b_json("", query)
+        payload, error = _catalog_response_items(request)
         if error:
             return error
         return Response(payload)
@@ -398,12 +660,7 @@ class CatalogFacetsView(APIView):
         if not category_id or not _is_uuid(category_id):
             return _error("INVALID_REQUEST", "category_id must be provided", status.HTTP_400_BAD_REQUEST)
 
-        query = dict(request.query_params)
-        query.pop("offset", None)
-        query.pop("limit", None)
-        query["limit"] = 200
-        query["offset"] = 0
-        items, error = _fetch_b2b_all_products(query)
+        items, error = _catalog_filtered_items(request)
         if error:
             return error
 
