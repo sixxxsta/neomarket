@@ -651,6 +651,52 @@ class B2BApiTests(TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.data['code'], 'FORBIDDEN')
 
+    def test_get_moderated_product_returns_full_payload(self):
+        product = self.create_product(status=Product.Status.MODERATED, title='Moderated phone')
+        sku = self.create_sku(product, price=1500, cost_price=1000, reserved_quantity=2, active_quantity=8)
+
+        response = self.client.get(f'/api/v1/products/{product.id}', **self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['id'], str(product.id))
+        self.assertEqual(response.data['status'], Product.Status.MODERATED)
+        self.assertEqual(response.data['title'], 'Moderated phone')
+        self.assertIsNone(response.data['blocking_reason'])
+        self.assertEqual(response.data['field_reports'], [])
+        self.assertEqual(len(response.data['skus']), 1)
+        self.assertEqual(response.data['skus'][0]['id'], str(sku.id))
+        self.assertEqual(response.data['skus'][0]['cost_price'], 1000)
+        self.assertEqual(response.data['skus'][0]['reserved_quantity'], 2)
+
+    def test_get_blocked_product_returns_blocking_reason_and_field_reports(self):
+        product = self.create_product(
+            status=Product.Status.BLOCKED,
+            blocking_reason={'title': 'Policy violation', 'id': str(uuid.uuid4())},
+            field_reports=[
+                {'field': 'title', 'message': 'Fix product title'},
+                {'field': 'description', 'message': 'Need details'},
+            ],
+        )
+        self.create_sku(product, active_quantity=1)
+
+        response = self.client.get(f'/api/v1/products/{product.id}', **self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['status'], Product.Status.BLOCKED)
+        self.assertEqual(response.data['blocking_reason']['title'], 'Policy violation')
+        self.assertEqual(len(response.data['field_reports']), 2)
+        self.assertEqual(response.data['field_reports'][0]['field'], 'title')
+
+    def test_get_others_product_returns_404(self):
+        foreign_product = self.create_product(seller_id=self.other_seller_id, status=Product.Status.MODERATED)
+
+        response = self.client.get(f'/api/v1/products/{foreign_product.id}', **self.headers)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data['code'], 'NOT_FOUND')
+
+    def test_get_nonexistent_returns_404(self):
+        response = self.client.get(f'/api/v1/products/{uuid.uuid4()}', **self.headers)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data['code'], 'NOT_FOUND')
+
     def test_delete_last_sku_on_moderation_returns_product_to_created(self):
         product = self.create_product(status=Product.Status.ON_MODERATION)
         sku = self.create_sku(product, active_quantity=2)
