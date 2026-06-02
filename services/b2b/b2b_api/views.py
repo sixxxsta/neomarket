@@ -289,7 +289,7 @@ def _inventory_operation_response(items, message):
 
 def _annotated_seller_products_queryset(seller_id):
     return (
-        Product.objects.filter(seller_id=seller_id)
+        Product.objects.filter(seller_id=seller_id, deleted=False)
         .select_related('category')
         .prefetch_related('skus')
         .annotate(
