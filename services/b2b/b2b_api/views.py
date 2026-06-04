@@ -287,6 +287,20 @@ def _inventory_operation_response(items, message):
     }
 
 
+def _catalog_visible_queryset():
+    return (
+        Product.objects.filter(
+            status=Product.Status.MODERATED,
+            deleted=False,
+            skus__deleted=False,
+            skus__active_quantity__gt=0,
+        )
+        .select_related('category')
+        .prefetch_related('skus')
+        .distinct()
+    )
+
+
 def _annotated_seller_products_queryset(seller_id):
     return (
         Product.objects.filter(seller_id=seller_id, deleted=False)
@@ -440,17 +454,7 @@ class ProductsView(APIView):
         except ValueError:
             return _error('BAD_REQUEST', 'Invalid pagination params', status.HTTP_400_BAD_REQUEST)
 
-        queryset = (
-            Product.objects.filter(
-                status=Product.Status.MODERATED,
-                deleted=False,
-                skus__deleted=False,
-                skus__active_quantity__gt=0,
-            )
-            .select_related('category')
-            .prefetch_related('skus')
-            .distinct()
-        )
+        queryset = _catalog_visible_queryset()
 
         ids_param = request.query_params.get('ids')
         if ids_param:
