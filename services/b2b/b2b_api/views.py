@@ -3,7 +3,7 @@ from uuid import UUID, uuid4
 
 import jwt
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Count, F, Q, Sum
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
@@ -230,13 +230,27 @@ def _normalize_field_reports(field_reports):
     return normalized
 
 
+def _product_for_moderation_response(product_id):
+    return (
+        Product.objects.select_related('category')
+        .prefetch_related('skus')
+        .filter(id=product_id)
+        .first()
+    )
+
+
 def apply_moderation_decision(validated_data):
     event_key = validated_data['idempotency_key']
-    existing = IntegrationInbox.objects.filter(message_id=event_key).first()
-    if existing:
-        return Product.objects.filter(id=validated_data['product_id']).select_related('category').prefetch_related('skus').first()
+    if IntegrationInbox.objects.filter(message_id=event_key).exists():
+        return _product_for_moderation_response(validated_data['product_id'])
 
-    product = Product.objects.select_related('category').prefetch_related('skus').filter(id=validated_data['product_id']).first()
+    product = (
+        Product.objects.select_for_update()
+        .select_related('category')
+        .prefetch_related('skus')
+        .filter(id=validated_data['product_id'])
+        .first()
+    )
     if not product:
         return None
 
@@ -253,16 +267,19 @@ def apply_moderation_decision(validated_data):
         product.field_reports = field_reports
 
     product.save(update_fields=['status', 'blocking_reason', 'field_reports', 'updated_at'])
-    IntegrationInbox.objects.create(
-        message_id=event_key,
-        source='moderation',
-        event_type=f'MODERATION_{decision_status}',
-        payload={
-            **validated_data,
-            'product_id': str(validated_data['product_id']),
-            'field_reports': field_reports,
-        },
-    )
+    try:
+        IntegrationInbox.objects.create(
+            message_id=event_key,
+            source='moderation',
+            event_type=f'MODERATION_{decision_status}',
+            payload={
+                **validated_data,
+                'product_id': str(validated_data['product_id']),
+                'field_reports': field_reports,
+            },
+        )
+    except IntegrityError:
+        return _product_for_moderation_response(validated_data['product_id'])
     _send_product_event(product, 'PRODUCT_UPDATED', 'UPDATED', snapshot_before=snapshot_before)
 
     if decision_status != Product.Status.MODERATED:

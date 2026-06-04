@@ -111,7 +111,7 @@ class CatalogSkuSerializer(serializers.ModelSerializer):
 
 class ProductSerializer(serializers.ModelSerializer):
     seller_id = serializers.UUIDField(read_only=True)
-    category_id = serializers.UUIDField(source='category_id', read_only=True)
+    category_id = serializers.UUIDField(read_only=True)
     slug = serializers.SerializerMethodField()
     blocking_reason = serializers.JSONField(read_only=True)
     field_reports = serializers.JSONField(read_only=True)

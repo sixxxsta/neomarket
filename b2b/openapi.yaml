@@ -398,7 +398,15 @@ paths:
   /api/v1/events/moderation:
     post:
       tags: [Products]
-      summary: Применить решение модерации к товару
+      operationId: b2b_apply_moderation_decision
+      summary: Применить решение модерации к товару (идемпотентно)
+      description: |
+        Межсервисный вызов Moderation→B2B (`X-Service-Key`). Три пути: `MODERATED` (очистка blocking_reason
+        и field_reports), `BLOCKED` + `hard_block=false` (soft, field_reports сохраняются, каскад `PRODUCT_BLOCKED`
+        в B2C), `BLOCKED` + `hard_block=true` (терминальный `HARD_BLOCKED`, каскад в B2C). Повтор с тем же
+        `idempotency_key` — 200 без повторных side effects (таблица processed_events / IntegrationInbox).
+      security:
+        - ServiceKeyAuth: []
       requestBody:
         required: true
         content:
@@ -407,11 +415,21 @@ paths:
               $ref: "#/components/schemas/ModerationDecisionEvent"
       responses:
         "200":
-          description: Решение модерации применено
+          description: Решение применено (или идемпотентный повтор)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Product"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Товар не найден
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/v1/products/batch-update:
     post:
@@ -1270,20 +1288,32 @@ components:
       properties:
         idempotency_key:
           type: string
+          description: Ключ идемпотентности (генерирует Moderation)
         product_id:
           type: string
           format: uuid
         status:
           type: string
           enum: [MODERATED, BLOCKED]
+          description: MODERATED — одобрение; BLOCKED — soft или hard (см. hard_block)
         hard_block:
           type: boolean
+          default: false
+          description: true → статус HARD_BLOCKED (терминальный, PUT/DELETE продавца → 403)
         blocking_reason:
+          type: object
           nullable: true
+          description: Причина блокировки для продавца (при BLOCKED)
         field_reports:
           type: array
+          description: Замечания по полям (сохраняются при soft block)
           items:
             type: object
+            properties:
+              field:
+                type: string
+              message:
+                type: string
 
     Invoice:
       type: object
