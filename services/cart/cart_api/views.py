@@ -766,15 +766,30 @@ class FavoriteSubscribeView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+def _banner_events_validation_error(serializer):
+    events_errors = serializer.errors.get("events")
+    if events_errors:
+        if any(err and "empty" in str(err).lower() for err in events_errors):
+            return _error("Массив events не может быть пустым", "EMPTY_EVENTS", status.HTTP_400_BAD_REQUEST)
+        for entry in events_errors:
+            if isinstance(entry, dict) and "event" in entry:
+                return _error(
+                    "Допустимые значения event: impression, click",
+                    "INVALID_EVENT_TYPE",
+                    status.HTTP_400_BAD_REQUEST,
+                )
+    return _error("Массив events не может быть пустым", "EMPTY_EVENTS", status.HTTP_400_BAD_REQUEST)
+
+
 @extend_schema_view(
-    post=extend_schema(operation_id="home_post_banner_events", request=BannerEventsRequestSerializer, responses=None),
+    post=extend_schema(operation_id="postBannerEvents", request=BannerEventsRequestSerializer, responses=None),
 )
 class BannerEventsView(APIView):
     @transaction.atomic
     def post(self, request):
         serializer = BannerEventsRequestSerializer(data=request.data)
         if not serializer.is_valid():
-            return _error("Массив events не может быть пустым", "EMPTY_EVENTS", status.HTTP_400_BAD_REQUEST)
+            return _banner_events_validation_error(serializer)
 
         user_id, _session_id, _token_error = _extract_identity(request)
         allowed_banner_ids = set(str(item) for item in Banner.objects.values_list("id", flat=True))
@@ -859,19 +874,22 @@ class CollectionProductsView(APIView):
 
 
 @extend_schema_view(
-    get=extend_schema(operation_id="home_get_banners", responses=OpenApiTypes.OBJECT),
+    get=extend_schema(operation_id="getHomeBanners", responses=OpenApiTypes.OBJECT),
 )
 class HomeBannersView(APIView):
     def get(self, request):
         now = timezone.now()
-        queryset = Banner.objects.filter(is_active=True).order_by("priority", "-created_at")
-        queryset = queryset.exclude(start_at__gt=now).exclude(end_at__lt=now)
+        queryset = (
+            Banner.objects.filter(is_active=True, placement=Banner.Placement.HOME)
+            .filter(Q(start_at__isnull=True) | Q(start_at__lte=now))
+            .filter(Q(end_at__isnull=True) | Q(end_at__gte=now))
+            .order_by("priority", "-created_at")
+        )
         items = [
             {
                 "id": str(banner.id),
                 "title": banner.title,
                 "image_url": banner.image_url,
-                "image": banner.image_url,
                 "link": banner.link,
                 "priority": banner.priority,
             }

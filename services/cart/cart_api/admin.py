@@ -29,8 +29,9 @@ class SubscriptionAdmin(admin.ModelAdmin):
 
 @admin.register(Banner)
 class BannerAdmin(admin.ModelAdmin):
-    list_display = ("title", "priority", "is_active", "start_at", "end_at")
+    list_display = ("title", "placement", "priority", "is_active", "start_at", "end_at")
     search_fields = ("title", "link")
+    list_filter = ("placement", "is_active")
 
 
 class CollectionProductInline(admin.TabularInline):
