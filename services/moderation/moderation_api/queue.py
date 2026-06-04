@@ -93,6 +93,26 @@ def _delete_open_cards(product_id):
     _open_cards_queryset(product_id).delete()
 
 
+def _has_active_stock(snapshot):
+    for sku in snapshot.get("skus") or []:
+        if isinstance(sku, dict) and not sku.get("deleted") and int(sku.get("active_quantity") or 0) > 0:
+            return True
+    return False
+
+
+def compute_priority_queue(product_id, event_type, snapshot_after):
+    if event_type == ModerationCard.EventType.CREATED:
+        return 1
+    if ModerationCard.objects.filter(
+        product_id=product_id,
+        queue_status=ModerationCard.QueueStatus.DECLINED,
+    ).exists():
+        return 2
+    if _has_active_stock(snapshot_after):
+        return 3
+    return 4
+
+
 def _card_event_type(event_type):
     normalized = str(event_type or ModerationCard.EventType.UPDATED).upper()
     if normalized in {
@@ -142,6 +162,7 @@ def enqueue_from_event(event: dict):
         else:
             card.queue_status = ModerationCard.QueueStatus.PENDING
             card.assigned_to = None
+            card.review_started_at = None
             card.decided_by = None
             card.decided_at = None
             card.decline_reason = None
@@ -153,6 +174,7 @@ def enqueue_from_event(event: dict):
                 "snapshot_before",
                 "snapshot_after",
                 "assigned_to",
+                "review_started_at",
                 "decided_by",
                 "decided_at",
                 "decline_reason",
@@ -160,14 +182,18 @@ def enqueue_from_event(event: dict):
                 "decline_fields",
                 "updated_at",
             ]
+        card.priority_queue = compute_priority_queue(product_id, stored_event_type, snapshot_after)
+        update_fields.append("priority_queue")
         card.save(update_fields=update_fields)
         for duplicate in existing_cards[1:]:
             duplicate.delete()
         return card
 
+    priority = compute_priority_queue(product_id, stored_event_type, snapshot_after)
     return ModerationCard.objects.create(
         product_id=product_id,
         event_type=stored_event_type,
+        priority_queue=priority,
         snapshot_before=snapshot_before,
         snapshot_after=snapshot_after,
     )

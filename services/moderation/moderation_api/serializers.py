@@ -17,6 +17,7 @@ class ModerationCardSerializer(serializers.ModelSerializer):
             'product_id',
             'event_type',
             'queue_status',
+            'priority_queue',
             'snapshot_before',
             'snapshot_after',
             'assigned_to',
@@ -29,6 +30,10 @@ class DeclineRequestSerializer(serializers.Serializer):
     reason_code = serializers.SlugField(max_length=64)
     comment = serializers.CharField(max_length=500, allow_blank=True, required=False)
     fields = serializers.ListField(child=serializers.CharField(max_length=128), required=False, allow_empty=True)
+
+
+class GetNextRequestSerializer(serializers.Serializer):
+    queue_id = serializers.IntegerField(required=False, allow_null=True, min_value=1, max_value=4)
 
 
 class EnqueueRequestSerializer(serializers.Serializer):

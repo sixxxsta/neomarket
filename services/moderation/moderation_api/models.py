@@ -39,7 +39,9 @@ class ModerationCard(models.Model):
     snapshot_before = models.JSONField(null=True, blank=True)
     snapshot_after = models.JSONField(default=dict)
 
+    priority_queue = models.PositiveSmallIntegerField(default=1, db_index=True)
     assigned_to = models.CharField(max_length=255, null=True, blank=True)
+    review_started_at = models.DateTimeField(null=True, blank=True, db_index=True)
     decided_by = models.CharField(max_length=255, null=True, blank=True)
     decided_at = models.DateTimeField(null=True, blank=True)
 
