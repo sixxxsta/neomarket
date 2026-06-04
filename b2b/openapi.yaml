@@ -253,12 +253,34 @@ paths:
           $ref: "#/components/responses/NotFound"
     delete:
       tags: [SKU]
-      summary: Удалить SKU
+      operationId: b2b_delete_sku
+      summary: Удалить SKU (логическое удаление)
+      description: |
+        Bearer JWT продавца. Порядок guardrails: HARD_BLOCKED → 403, `reserved_quantity>0` → 409,
+        затем soft-delete SKU. Если это последний живой SKU и товар `ON_MODERATION` — товар → `CREATED`
+        и событие `DELETED` в Moderation. Для `MODERATED` с `active_quantity>0` до удаления — outbox
+        `SKU_OUT_OF_STOCK` в B2C.
+      security:
+        - BearerAuth: []
       responses:
         "204":
           description: SKU удален
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Чужой SKU или товар HARD_BLOCKED
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: На SKU есть активный резерв
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/v1/invoices:
     post:

@@ -796,32 +796,42 @@ class SkuMutationView(APIView):
             return _error('BAD_REQUEST', 'SKU id is required', status.HTTP_400_BAD_REQUEST)
 
         sku = Sku.objects.select_related('product').prefetch_related('product__skus').filter(id=parsed_id).first()
-        if not sku or sku.deleted:
-            return _error('NOT_FOUND', 'SKU not found', status.HTTP_404_NOT_FOUND)
-        if sku.product.seller_id != seller_id:
-            return _error('FORBIDDEN', 'Cannot delete another seller SKU', status.HTTP_403_FORBIDDEN)
-        if sku.product.status == Product.Status.HARD_BLOCKED:
-            return _error('FORBIDDEN', 'HARD_BLOCKED product cannot be edited', status.HTTP_403_FORBIDDEN)
-        if int(sku.reserved_quantity or 0) > 0:
-            return _error('CONFLICT', 'SKU has active reserves', status.HTTP_409_CONFLICT)
+        validation_error = _validate_sku_deletion(sku, seller_id)
+        if validation_error:
+            return validation_error
 
-        snapshot_before = _serialize_product_snapshot(sku.product)
-        had_stock = sku.product.status == Product.Status.MODERATED and int(sku.active_quantity or 0) > 0
-
-        sku.deleted = True
-        sku.active_quantity = 0
-        sku.save(update_fields=['deleted', 'active_quantity', 'updated_at'])
-
-        if had_stock:
-            _send_sku_stock_event(sku)
-
-        has_other_live_skus = sku.product.skus.filter(deleted=False).exclude(id=sku.id).exists()
-        if not has_other_live_skus and sku.product.status == Product.Status.ON_MODERATION:
-            sku.product.status = Product.Status.CREATED
-            sku.product.save(update_fields=['status', 'updated_at'])
-            _send_product_event(sku.product, 'PRODUCT_UPDATED', 'DELETED', snapshot_before=snapshot_before)
-
+        _apply_sku_deletion(sku)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _validate_sku_deletion(sku, seller_id):
+    if not sku or sku.deleted:
+        return _error('NOT_FOUND', 'SKU not found', status.HTTP_404_NOT_FOUND)
+    if sku.product.seller_id != seller_id:
+        return _error('FORBIDDEN', 'Cannot delete another seller SKU', status.HTTP_403_FORBIDDEN)
+    if sku.product.status == Product.Status.HARD_BLOCKED:
+        return _error('FORBIDDEN', 'HARD_BLOCKED product cannot be edited', status.HTTP_403_FORBIDDEN)
+    if int(sku.reserved_quantity or 0) > 0:
+        return _error('CONFLICT', 'SKU has active reserves', status.HTTP_409_CONFLICT)
+    return None
+
+
+def _apply_sku_deletion(sku):
+    snapshot_before = _serialize_product_snapshot(sku.product)
+    had_stock = sku.product.status == Product.Status.MODERATED and int(sku.active_quantity or 0) > 0
+
+    sku.deleted = True
+    sku.active_quantity = 0
+    sku.save(update_fields=['deleted', 'active_quantity', 'updated_at'])
+
+    if had_stock:
+        _send_sku_stock_event(sku)
+
+    has_other_live_skus = sku.product.skus.filter(deleted=False).exclude(id=sku.id).exists()
+    if not has_other_live_skus and sku.product.status == Product.Status.ON_MODERATION:
+        sku.product.status = Product.Status.CREATED
+        sku.product.save(update_fields=['status', 'updated_at'])
+        _send_product_event(sku.product, 'PRODUCT_UPDATED', 'DELETED', snapshot_before=snapshot_before)
 
 
 def _validate_invoice_items(seller_id, items):

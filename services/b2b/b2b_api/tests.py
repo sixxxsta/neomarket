@@ -1072,11 +1072,42 @@ class B2BApiTests(TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.data['code'], 'NOT_FOUND')
 
-    def test_delete_last_sku_on_moderation_returns_product_to_created(self):
+    def _delete_sku(self, sku_id, headers=None):
+        return self.client.delete(f'/api/v1/skus/{sku_id}', **(headers if headers is not None else self.headers))
+
+    def test_delete_sku_succeeds(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        keep = self.create_sku(product, name='Keep', active_quantity=4)
+        remove = self.create_sku(product, name='Remove', active_quantity=2)
+
+        response = self._delete_sku(remove.id)
+        self.assertEqual(response.status_code, 204)
+
+        remove.refresh_from_db()
+        keep.refresh_from_db()
+        product.refresh_from_db()
+        self.assertTrue(remove.deleted)
+        self.assertEqual(remove.active_quantity, 0)
+        self.assertFalse(keep.deleted)
+        self.assertEqual(product.status, Product.Status.MODERATED)
+
+    def test_delete_sku_with_active_reserves_returns_409(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        sku = self.create_sku(product, active_quantity=5, reserved_quantity=2)
+
+        response = self._delete_sku(sku.id)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data['code'], 'CONFLICT')
+
+        sku.refresh_from_db()
+        self.assertFalse(sku.deleted)
+        self.assertEqual(sku.reserved_quantity, 2)
+
+    def test_last_sku_on_moderation_transitions_product_to_created(self):
         product = self.create_product(status=Product.Status.ON_MODERATION)
         sku = self.create_sku(product, active_quantity=2)
 
-        response = self.client.delete(f'/api/v1/skus/{sku.id}', **self.headers)
+        response = self._delete_sku(sku.id)
         self.assertEqual(response.status_code, 204)
 
         product.refresh_from_db()
@@ -1087,6 +1118,32 @@ class B2BApiTests(TestCase):
         event = IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_UPDATED').order_by('-created_at').first()
         self.assertIsNotNone(event)
         self.assertEqual(event.payload['event_type'], 'DELETED')
+
+    def test_delete_sku_hard_blocked_product_returns_403(self):
+        product = self.create_product(status=Product.Status.HARD_BLOCKED)
+        sku = self.create_sku(product, active_quantity=1, reserved_quantity=0)
+
+        response = self._delete_sku(sku.id)
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data['code'], 'FORBIDDEN')
+
+        sku.refresh_from_db()
+        self.assertFalse(sku.deleted)
+
+    def test_sku_out_of_stock_event_on_moderated_product(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        sku = self.create_sku(product, active_quantity=3, reserved_quantity=0)
+
+        response = self._delete_sku(sku.id)
+        self.assertEqual(response.status_code, 204)
+
+        outbox_event = IntegrationOutbox.objects.filter(
+            aggregate_id=product.id,
+            event_type='SKU_OUT_OF_STOCK',
+        ).order_by('-created_at').first()
+        self.assertIsNotNone(outbox_event)
+        self.assertEqual(outbox_event.payload['sku_id'], str(sku.id))
+        self.assertEqual(outbox_event.payload['event_type'], 'SKU_OUT_OF_STOCK')
 
     def test_reserve_requires_service_key(self):
         product = self.create_product(status=Product.Status.MODERATED)
