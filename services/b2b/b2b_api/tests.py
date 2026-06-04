@@ -504,49 +504,58 @@ class B2BApiTests(TestCase):
         self.assertEqual(moderation_delete.payload['snapshot_after']['deleted'], True)
         self.assertEqual(moderation_delete.payload['snapshot_after']['skus'], [])
 
-    def test_apply_moderation_event_hard_block_is_idempotent_and_blocks_edits(self):
-        product = self.create_product(status=Product.Status.ON_MODERATION)
+    def _post_moderation_event(self, payload, headers=None):
+        return self.client.post(
+            '/api/v1/events/moderation',
+            payload,
+            format='json',
+            **(headers if headers is not None else self.service_headers),
+        )
+
+    def test_moderated_event_clears_blocking_data(self):
+        product = self.create_product(
+            status=Product.Status.BLOCKED,
+            blocking_reason={'title': 'Previous block'},
+            field_reports=[{'field': 'title', 'message': 'Fix title'}],
+        )
         self.create_sku(product)
         payload = {
-            'idempotency_key': 'evt-hard-block',
+            'idempotency_key': 'evt-moderated-clear',
             'product_id': str(product.id),
-            'status': 'BLOCKED',
-            'hard_block': True,
-            'blocking_reason': {'title': 'Forbidden category'},
-            'field_reports': [{'field': 'title', 'message': 'Not allowed'}],
+            'status': 'MODERATED',
         }
 
-        response = self.client.post('/api/v1/events/moderation', payload, format='json', **self.service_headers)
+        response = self._post_moderation_event(payload)
         self.assertEqual(response.status_code, 200)
 
         product.refresh_from_db()
-        self.assertEqual(product.status, Product.Status.HARD_BLOCKED)
-        self.assertEqual(product.blocking_reason['title'], 'Forbidden category')
+        self.assertEqual(product.status, Product.Status.MODERATED)
+        self.assertIsNone(product.blocking_reason)
+        self.assertEqual(product.field_reports, [])
 
-        duplicate = self.client.post('/api/v1/events/moderation', payload, format='json', **self.service_headers)
-        self.assertEqual(duplicate.status_code, 200)
-        self.assertEqual(IntegrationInbox.objects.filter(message_id='evt-hard-block').count(), 1)
-
-        edit = self.client.put(
-            f'/api/v1/products/{product.id}',
-            {'title': 'Changed title'},
-            format='json',
-            **self.headers,
+        projection_event = IntegrationOutbox.objects.filter(
+            aggregate_id=product.id,
+            event_type='PRODUCT_UPDATED',
+        ).order_by('-created_at').first()
+        self.assertIsNotNone(projection_event)
+        self.assertEqual(projection_event.payload['snapshot_after']['status'], Product.Status.MODERATED)
+        self.assertFalse(
+            IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_BLOCKED').exists()
         )
-        self.assertEqual(edit.status_code, 403)
 
-    def test_apply_soft_block_saves_reports_and_emits_b2c_event(self):
+    def test_blocked_soft_saves_field_reports(self):
         product = self.create_product(status=Product.Status.ON_MODERATION)
         self.create_sku(product)
         payload = {
             'idempotency_key': 'evt-soft-block',
             'product_id': str(product.id),
             'status': 'BLOCKED',
+            'hard_block': False,
             'blocking_reason': {'title': 'Needs documents'},
             'field_reports': [{'field': 'description', 'message': 'Need more details'}],
         }
 
-        response = self.client.post('/api/v1/events/moderation', payload, format='json', **self.service_headers)
+        response = self._post_moderation_event(payload)
         self.assertEqual(response.status_code, 200)
 
         product.refresh_from_db()
@@ -557,30 +566,105 @@ class B2BApiTests(TestCase):
         blocked_event = IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_BLOCKED').first()
         self.assertIsNotNone(blocked_event)
         self.assertEqual(blocked_event.payload['hard_block'], False)
-        projection_event = IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_UPDATED').order_by('-created_at').first()
-        self.assertIsNotNone(projection_event)
-        self.assertEqual(projection_event.payload['snapshot_after']['status'], Product.Status.BLOCKED)
+        self.assertEqual(blocked_event.payload['event_type'], 'PRODUCT_BLOCKED')
 
-    def test_apply_moderation_event_moderated_emits_projection_update(self):
+    def test_blocked_hard_sets_terminal_status(self):
         product = self.create_product(status=Product.Status.ON_MODERATION)
-        self.create_sku(product)
+        sku = self.create_sku(product)
         payload = {
-            'idempotency_key': 'evt-approve',
+            'idempotency_key': 'evt-hard-block',
             'product_id': str(product.id),
-            'status': 'MODERATED',
+            'status': 'BLOCKED',
+            'hard_block': True,
+            'blocking_reason': {'title': 'Forbidden category'},
+            'field_reports': [{'field': 'title', 'message': 'Not allowed'}],
         }
 
-        response = self.client.post('/api/v1/events/moderation', payload, format='json', **self.service_headers)
+        response = self._post_moderation_event(payload)
         self.assertEqual(response.status_code, 200)
 
         product.refresh_from_db()
-        self.assertEqual(product.status, Product.Status.MODERATED)
-        self.assertIsNone(product.blocking_reason)
-        self.assertEqual(product.field_reports, [])
+        self.assertEqual(product.status, Product.Status.HARD_BLOCKED)
+        self.assertEqual(product.blocking_reason['title'], 'Forbidden category')
 
-        projection_event = IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_UPDATED').order_by('-created_at').first()
-        self.assertIsNotNone(projection_event)
-        self.assertEqual(projection_event.payload['snapshot_after']['status'], Product.Status.MODERATED)
+        blocked_event = IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_BLOCKED').first()
+        self.assertIsNotNone(blocked_event)
+        self.assertTrue(blocked_event.payload['hard_block'])
+        self.assertIn(str(sku.id), blocked_event.payload['sku_ids'])
+
+    def test_hard_blocked_product_rejects_seller_edits(self):
+        product = self.create_product(status=Product.Status.ON_MODERATION)
+        self.create_sku(product)
+        self._post_moderation_event(
+            {
+                'idempotency_key': 'evt-hard-for-403',
+                'product_id': str(product.id),
+                'status': 'BLOCKED',
+                'hard_block': True,
+                'blocking_reason': {'title': 'Terminal block'},
+            }
+        )
+        product.refresh_from_db()
+        self.assertEqual(product.status, Product.Status.HARD_BLOCKED)
+
+        edit = self.client.put(
+            f'/api/v1/products/{product.id}',
+            {'title': 'Changed title'},
+            format='json',
+            **self.headers,
+        )
+        self.assertEqual(edit.status_code, 403)
+        self.assertEqual(edit.data['code'], 'FORBIDDEN')
+
+        delete = self.client.delete(f'/api/v1/products/{product.id}', **self.headers)
+        self.assertEqual(delete.status_code, 403)
+        self.assertEqual(delete.data['code'], 'FORBIDDEN')
+
+        product.refresh_from_db()
+        self.assertEqual(product.status, Product.Status.HARD_BLOCKED)
+        self.assertEqual(product.title, 'Product')
+
+    def test_duplicate_event_same_idempotency_key_no_side_effects(self):
+        product = self.create_product(status=Product.Status.ON_MODERATION)
+        self.create_sku(product)
+        payload = {
+            'idempotency_key': 'evt-dedupe',
+            'product_id': str(product.id),
+            'status': 'BLOCKED',
+            'blocking_reason': {'title': 'Needs documents'},
+            'field_reports': [{'field': 'description', 'message': 'Need more details'}],
+        }
+
+        first = self._post_moderation_event(payload)
+        self.assertEqual(first.status_code, 200)
+        product.refresh_from_db()
+        self.assertEqual(product.status, Product.Status.BLOCKED)
+        outbox_count = IntegrationOutbox.objects.filter(aggregate_id=product.id).count()
+        inbox_count = IntegrationInbox.objects.filter(message_id='evt-dedupe').count()
+
+        duplicate = self._post_moderation_event(payload)
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertEqual(duplicate.data, first.data)
+
+        product.refresh_from_db()
+        self.assertEqual(product.status, Product.Status.BLOCKED)
+        self.assertEqual(IntegrationInbox.objects.filter(message_id='evt-dedupe').count(), inbox_count)
+        self.assertEqual(IntegrationOutbox.objects.filter(aggregate_id=product.id).count(), outbox_count)
+
+    def test_moderation_missing_service_key_returns_401(self):
+        product = self.create_product(status=Product.Status.ON_MODERATION)
+        response = self._post_moderation_event(
+            {
+                'idempotency_key': 'evt-no-key',
+                'product_id': str(product.id),
+                'status': 'MODERATED',
+            },
+            headers={},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.data['code'], 'UNAUTHORIZED')
+        product.refresh_from_db()
+        self.assertEqual(product.status, Product.Status.ON_MODERATION)
 
     def test_moderation_stream_consumer_applies_approved_event_to_b2b(self):
         product = self.create_product(status=Product.Status.ON_MODERATION)
