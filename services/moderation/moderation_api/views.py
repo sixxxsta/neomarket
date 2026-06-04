@@ -217,5 +217,16 @@ class BlockingReasonsView(APIView):
         if error:
             return error
 
-        reasons = BlockingReason.objects.filter(is_active=True).order_by('title')
+        from .blocking_reasons import list_active_blocking_reasons
+
+        hard_block = request.query_params.get('hard_block')
+        if hard_block is not None:
+            normalized = str(hard_block).strip().lower()
+            if normalized not in {'true', 'false', '1', '0'}:
+                return _error('hard_block must be true or false', 'INVALID_PARAMETER', status.HTTP_400_BAD_REQUEST)
+            hard_block = normalized in {'true', '1'}
+        else:
+            hard_block = None
+
+        reasons = list_active_blocking_reasons(hard_block=hard_block)
         return Response(BlockingReasonSerializer(reasons, many=True).data)
