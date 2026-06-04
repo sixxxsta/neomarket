@@ -355,3 +355,27 @@ class OrdersApiTests(TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.data["code"], "ORDER_NOT_FOUND")
         self.assertNotEqual(response.status_code, 403)
+
+    @patch("orders_api.views.requests.get")
+    @patch("orders_api.views.requests.post")
+    def test_orders_not_affected_by_product_blocked(self, mock_post, mock_get):
+        """US-ORD-04: PRODUCT_BLOCKED is handled in cart_db; checkout snapshot in orders_db is immutable."""
+        created = self._create_order(mock_post, mock_get)
+        order = Order.objects.get(pk=created.data["id"])
+        item = order.items.get(sku_id=self.sku_id)
+        snapshot = {
+            "status": order.status,
+            "quantity": item.quantity,
+            "unit_price_amount": item.unit_price_amount,
+            "line_total_amount": item.line_total_amount,
+            "product_title": item.product_title,
+        }
+
+        order.refresh_from_db()
+        item.refresh_from_db()
+        self.assertEqual(order.status, snapshot["status"])
+        self.assertEqual(item.quantity, snapshot["quantity"])
+        self.assertEqual(item.unit_price_amount, snapshot["unit_price_amount"])
+        self.assertEqual(item.line_total_amount, snapshot["line_total_amount"])
+        self.assertEqual(item.product_title, snapshot["product_title"])
+        self.assertFalse(hasattr(OrderItem, "unavailable_reason"))

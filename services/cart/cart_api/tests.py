@@ -511,18 +511,45 @@ class CartApiTests(TestCase):
         inactive_response = self.client.get(f"/api/v1/collections/{inactive.id}/products")
         self.assertEqual(inactive_response.status_code, 404)
 
-    @patch("cart_api.views.requests.get")
-    def test_product_event_marks_cart_items_unavailable_and_is_idempotent(self, mock_get):
-        cart = Cart.objects.create(user_id=self.user_id)
-        CartItem.objects.create(cart=cart, product_id=self.product_id, sku_id=self.sku_id, quantity=1)
-        payload = {
-            "idempotency_key": "evt-1",
-            "event": "PRODUCT_BLOCKED",
+    def _product_event_payload(self, idempotency_key="evt-block-1", event="PRODUCT_BLOCKED", sku_ids=None):
+        return {
+            "idempotency_key": idempotency_key,
+            "event": event,
             "product_id": str(self.product_id),
-            "sku_ids": [str(self.sku_id)],
+            "sku_ids": sku_ids if sku_ids is not None else [str(self.sku_id)],
             "reason": "moderation",
-            "date": "2026-05-12T08:00:00Z",
         }
+
+    def test_product_blocked_marks_cart_items_unavailable(self):
+        cart = Cart.objects.create(user_id=self.user_id)
+        item = CartItem.objects.create(
+            cart=cart, product_id=self.product_id, sku_id=self.sku_id, quantity=2
+        )
+        other_sku = uuid.uuid4()
+        other_item = CartItem.objects.create(
+            cart=cart, product_id=self.product_id, sku_id=other_sku, quantity=1
+        )
+
+        response = self.client.post(
+            "/api/v1/events/product",
+            self._product_event_payload(),
+            format="json",
+            HTTP_X_SERVICE_KEY=settings.INTERNAL_SERVICE_KEY,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data.get("accepted"))
+
+        item.refresh_from_db()
+        other_item.refresh_from_db()
+        self.assertEqual(item.unavailable_reason, CartItem.UnavailableReason.PRODUCT_BLOCKED)
+        self.assertIsNone(other_item.unavailable_reason)
+
+    def test_idempotent_event_no_side_effects(self):
+        cart = Cart.objects.create(user_id=self.user_id)
+        item = CartItem.objects.create(
+            cart=cart, product_id=self.product_id, sku_id=self.sku_id, quantity=1
+        )
+        payload = self._product_event_payload(idempotency_key="evt-dup-ord04")
 
         first = self.client.post(
             "/api/v1/events/product",
@@ -531,14 +558,8 @@ class CartApiTests(TestCase):
             HTTP_X_SERVICE_KEY=settings.INTERNAL_SERVICE_KEY,
         )
         self.assertEqual(first.status_code, 200)
-
-        blocked = self._catalog_product()
-        blocked["status"] = "BLOCKED"
-        mock_get.return_value = self._mock_response({"items": [blocked]})
-        cart_response = self.client.get("/api/v1/cart", HTTP_AUTHORIZATION=self.auth)
-        self.assertEqual(cart_response.status_code, 200)
-        self.assertEqual(cart_response.data["items"][0]["unavailable_reason"], "PRODUCT_BLOCKED")
-        self.assertFalse(cart_response.data["items"][0]["available"])
+        item.refresh_from_db()
+        self.assertEqual(item.unavailable_reason, CartItem.UnavailableReason.PRODUCT_BLOCKED)
 
         second = self.client.post(
             "/api/v1/events/product",
@@ -547,4 +568,40 @@ class CartApiTests(TestCase):
             HTTP_X_SERVICE_KEY=settings.INTERNAL_SERVICE_KEY,
         )
         self.assertEqual(second.status_code, 200)
-        self.assertEqual(ProductEventInbox.objects.filter(idempotency_key="evt-1").count(), 1)
+        self.assertEqual(
+            ProductEventInbox.objects.filter(idempotency_key="evt-dup-ord04").count(),
+            1,
+        )
+        item.refresh_from_db()
+        self.assertEqual(item.unavailable_reason, CartItem.UnavailableReason.PRODUCT_BLOCKED)
+
+    def test_missing_service_key_returns_401(self):
+        response = self.client.post(
+            "/api/v1/events/product",
+            self._product_event_payload(),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.data["code"], "UNAUTHORIZED")
+
+    def test_orders_not_affected_by_product_blocked(self):
+        """US-ORD-04: only cart_items.unavailable_reason changes; quantity and orders DB stay intact."""
+        from django.apps import apps
+
+        with self.assertRaises(LookupError):
+            apps.get_model("cart_api", "Order")
+
+        cart = Cart.objects.create(user_id=self.user_id)
+        item = CartItem.objects.create(
+            cart=cart, product_id=self.product_id, sku_id=self.sku_id, quantity=4
+        )
+        response = self.client.post(
+            "/api/v1/events/product",
+            self._product_event_payload(),
+            format="json",
+            HTTP_X_SERVICE_KEY=settings.INTERNAL_SERVICE_KEY,
+        )
+        self.assertEqual(response.status_code, 200)
+        item.refresh_from_db()
+        self.assertEqual(item.unavailable_reason, CartItem.UnavailableReason.PRODUCT_BLOCKED)
+        self.assertEqual(item.quantity, 4)

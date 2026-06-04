@@ -1,0 +1,417 @@
+openapi: 3.0.3
+info:
+  title: "NeoMarket B2C: Заказы"
+  version: "1.0.0"
+  description: |
+    Контракт оформления заказов: создание, просмотр, история, отмена и переходы статусов.
+
+servers:
+  - url: https://api.neomarket.local
+
+tags:
+  - name: Orders
+  - name: Order Status
+
+security:
+  - BearerAuth: []
+
+paths:
+  /api/v1/orders:
+    post:
+      tags: [Orders]
+      summary: Создать заказ из checkout payload
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOrderRequest"
+      responses:
+        "201":
+          description: Заказ создан
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          description: Невозможно создать заказ из-за проблем с корзиной
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    get:
+      tags: [Orders]
+      summary: Получить историю заказов текущего пользователя
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: История заказов
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/orders/{order_id}:
+    parameters:
+      - $ref: "#/components/parameters/OrderId"
+    get:
+      tags: [Orders]
+      summary: Получить заказ по идентификатору
+      responses:
+        "200":
+          description: Заказ найден
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/orders/{order_id}/cancel:
+    post:
+      tags: [Orders]
+      summary: Отменить заказ
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CancelOrderRequest"
+      responses:
+        "200":
+          description: Заказ отменен
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Заказ уже нельзя отменить в текущем статусе
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/orders/{order_id}/status:
+    patch:
+      tags: [Order Status]
+      summary: Обновить статус заказа (внутренний API/админка)
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateOrderStatusRequest"
+      responses:
+        "200":
+          description: Статус заказа обновлен
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Недопустимый переход статуса
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  # Реализуется cart-сервисом (US-ORD-04); заказы не изменяются.
+  /api/v1/events/product:
+    post:
+      tags: [Orders]
+      summary: Приём событий о товарах от B2B (server-to-server)
+      description: |
+        B2B сообщает о блокировке, удалении или отсутствии SKU.
+        Cart-сервис помечает `cart_items.unavailable_reason` batch-UPDATE по `sku_ids`.
+        Заказы не изменяются: цены и статусы зафиксированы при checkout.
+
+        Требуется заголовок `X-Service-Key`. Идемпотентность по `idempotency_key`
+        (повтор → 200 без побочных эффектов).
+      security: []
+      parameters:
+        - name: X-Service-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductLifecycleEvent"
+      responses:
+        "200":
+          description: Событие принято (в т.ч. дубликат idempotency_key)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductEventAccepted"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    OrderId:
+      name: order_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: Невалидный запрос
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Пользователь не авторизован
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Заказ не найден
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Conflict:
+      description: Конфликт данных
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: INVALID_STATE_TRANSITION
+        message:
+          type: string
+          example: Переход статуса недопустим
+
+    OrderStatus:
+      type: string
+      enum: [PENDING, PAID, ASSEMBLING, SHIPPED, DELIVERED, CANCELED]
+
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          type: integer
+          minimum: 0
+          description: Сумма в копейках
+        currency:
+          type: string
+          example: RUB
+
+    OrderItem:
+      type: object
+      required: [product_id, sku_id, quantity, unit_price, line_total]
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        sku_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+        unit_price:
+          $ref: "#/components/schemas/Money"
+        line_total:
+          $ref: "#/components/schemas/Money"
+
+    DeliveryAddress:
+      type: object
+      required: [city, street, house, recipient_name, recipient_phone]
+      properties:
+        city:
+          type: string
+        street:
+          type: string
+        house:
+          type: string
+        apartment:
+          type: string
+          nullable: true
+        postal_code:
+          type: string
+          nullable: true
+        recipient_name:
+          type: string
+        recipient_phone:
+          type: string
+
+    CreateOrderRequest:
+      type: object
+      required: [items, total, delivery_address, payment_method]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/OrderItem"
+        total:
+          $ref: "#/components/schemas/Money"
+        delivery_address:
+          $ref: "#/components/schemas/DeliveryAddress"
+        payment_method:
+          type: string
+          enum: [CARD_ONLINE, CASH_ON_DELIVERY]
+        comment:
+          type: string
+          maxLength: 500
+          nullable: true
+
+    ProductLifecycleEvent:
+      type: object
+      required: [idempotency_key, event, product_id, sku_ids]
+      properties:
+        idempotency_key:
+          type: string
+          maxLength: 128
+          description: Уникальный ключ события (ретраи B2B)
+        event:
+          type: string
+          enum: [PRODUCT_BLOCKED, PRODUCT_DELETED, SKU_OUT_OF_STOCK, OUT_OF_STOCK]
+        product_id:
+          type: string
+          format: uuid
+        sku_ids:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            format: uuid
+        reason:
+          type: string
+          nullable: true
+
+    ProductEventAccepted:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+
+    CancelOrderRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+
+    UpdateOrderStatusRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          $ref: "#/components/schemas/OrderStatus"
+        reason:
+          type: string
+          maxLength: 500
+
+    Order:
+      type: object
+      required: [id, user_id, status, items, total, payment_method, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        status:
+          $ref: "#/components/schemas/OrderStatus"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrderItem"
+        total:
+          $ref: "#/components/schemas/Money"
+        payment_method:
+          type: string
+          enum: [CARD_ONLINE, CASH_ON_DELIVERY]
+        delivery_address:
+          $ref: "#/components/schemas/DeliveryAddress"
+        cancel_reason:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    OrderListResponse:
+      type: object
+      required: [items, total, limit, offset]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Order"
+        total:
+          type: integer
+          minimum: 0
+        limit:
+          type: integer
+        offset:
+          type: integer
