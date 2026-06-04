@@ -233,7 +233,7 @@ def _outbox_event(order_id, event_type, payload):
 
 @extend_schema_view(
     post=extend_schema(operation_id="createOrder", request=CreateOrderRequestSerializer, responses=OrderSerializer),
-    get=extend_schema(operation_id="orders_list", responses=OpenApiTypes.OBJECT),
+    get=extend_schema(operation_id="listOrders", responses=OpenApiTypes.OBJECT),
 )
 class OrdersView(APIView):
     @transaction.atomic
@@ -406,10 +406,18 @@ class OrdersView(APIView):
             queryset = queryset.filter(status="CANCELED" if status_filter == "CANCELLED" else status_filter)
         total = queryset.count()
         orders = queryset[offset : offset + limit]
-        return Response({"items": OrderListItemSerializer(orders, many=True).data, "total_count": total, "limit": limit, "offset": offset})
+        return Response(
+            {
+                "items": OrderListItemSerializer(orders, many=True).data,
+                "total": total,
+                "total_count": total,
+                "limit": limit,
+                "offset": offset,
+            }
+        )
 
 
-@extend_schema_view(get=extend_schema(operation_id="orders_get", responses=OrderSerializer))
+@extend_schema_view(get=extend_schema(operation_id="getOrder", responses=OrderSerializer))
 class OrderDetailView(APIView):
     def get(self, request, order_id):
         user_id, error = _get_user_id(request)

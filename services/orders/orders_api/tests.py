@@ -236,14 +236,78 @@ class OrdersApiTests(TestCase):
         self.assertEqual(delivered.status_code, 200)
         self.assertEqual(delivered.data["status"], "DELIVERED")
 
+    def _create_order(self, mock_post, mock_get, user_auth=None):
+        mock_get.return_value = self._catalog_response()
+        mock_post.return_value = self._inventory_response(
+            {"reserved": True, "items": [{"sku_id": str(self.sku_id), "reserved_quantity": 1}]}
+        )
+        payload = self._order_payload()
+        return self.client.post(
+            "/api/v1/orders",
+            payload,
+            format="json",
+            HTTP_AUTHORIZATION=user_auth or self.auth,
+            HTTP_IDEMPOTENCY_KEY=payload["idempotency_key"],
+        )
+
     @patch("orders_api.views.requests.get")
     @patch("orders_api.views.requests.post")
-    def test_orders_list_returns_compact_items(self, mock_post, mock_get):
-        mock_get.return_value = self._catalog_response()
-        mock_post.return_value = self._inventory_response({"reserved": True, "items": [{"sku_id": str(self.sku_id), "reserved_quantity": 1}]})
-        self.client.post("/api/v1/orders", self._order_payload(), format="json", HTTP_AUTHORIZATION=self.auth)
+    def test_orders_list_returns_own_orders_paginated(self, mock_post, mock_get):
+        self.assertEqual(self._create_order(mock_post, mock_get).status_code, 201)
+        self.assertEqual(self._create_order(mock_post, mock_get).status_code, 201)
 
-        response = self.client.get("/api/v1/orders?limit=20&offset=0", HTTP_AUTHORIZATION=self.auth)
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["total_count"], 1)
-        self.assertIn("items_count", response.data["items"][0])
+        other_user_id = uuid.uuid4()
+        other_auth = f"Bearer {_jwt_for_user(other_user_id)}"
+        self.assertEqual(self._create_order(mock_post, mock_get, user_auth=other_auth).status_code, 201)
+
+        page_one = self.client.get("/api/v1/orders?limit=1&offset=0", HTTP_AUTHORIZATION=self.auth)
+        self.assertEqual(page_one.status_code, 200)
+        self.assertEqual(len(page_one.data["items"]), 1)
+        self.assertEqual(page_one.data["total_count"], 2)
+        self.assertEqual(page_one.data["total"], 2)
+
+        page_two = self.client.get("/api/v1/orders?limit=1&offset=1", HTTP_AUTHORIZATION=self.auth)
+        self.assertEqual(page_two.status_code, 200)
+        self.assertEqual(len(page_two.data["items"]), 1)
+        self.assertNotEqual(page_one.data["items"][0]["id"], page_two.data["items"][0]["id"])
+
+        paid_only = self.client.get("/api/v1/orders?status=PAID", HTTP_AUTHORIZATION=self.auth)
+        self.assertEqual(paid_only.status_code, 200)
+        self.assertEqual(paid_only.data["total_count"], 2)
+
+        spoofed = self.client.get(
+            f"/api/v1/orders?user_id={other_user_id}",
+            HTTP_AUTHORIZATION=self.auth,
+        )
+        self.assertEqual(spoofed.status_code, 200)
+        self.assertEqual(spoofed.data["total_count"], 2)
+
+    @patch("orders_api.views.requests.get")
+    @patch("orders_api.views.requests.post")
+    def test_order_detail_shows_fixed_prices(self, mock_post, mock_get):
+        created = self._create_order(mock_post, mock_get)
+        order_id = created.data["id"]
+
+        changed_catalog = self._catalog_response()
+        changed_catalog.json.return_value["items"][0]["skus"][0]["price"] = 99999999
+        mock_get.return_value = changed_catalog
+
+        detail = self.client.get(f"/api/v1/orders/{order_id}", HTTP_AUTHORIZATION=self.auth)
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.data["items"][0]["unit_price"], 12999000)
+        self.assertEqual(mock_get.call_count, 1)
+
+        order_item = OrderItem.objects.get(order_id=order_id)
+        self.assertEqual(order_item.unit_price_amount, 12999000)
+
+    @patch("orders_api.views.requests.get")
+    @patch("orders_api.views.requests.post")
+    def test_other_user_order_returns_404_not_403(self, mock_post, mock_get):
+        created = self._create_order(mock_post, mock_get)
+        order_id = created.data["id"]
+        other_auth = f"Bearer {_jwt_for_user(uuid.uuid4())}"
+
+        response = self.client.get(f"/api/v1/orders/{order_id}", HTTP_AUTHORIZATION=other_auth)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data["code"], "ORDER_NOT_FOUND")
+        self.assertNotEqual(response.status_code, 403)
