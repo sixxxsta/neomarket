@@ -938,10 +938,16 @@ class ProductEventsView(APIView):
             "PRODUCT_BLOCKED": CartItem.UnavailableReason.PRODUCT_BLOCKED,
             "PRODUCT_DELETED": CartItem.UnavailableReason.PRODUCT_DELETED,
             "SKU_OUT_OF_STOCK": CartItem.UnavailableReason.OUT_OF_STOCK,
+            "OUT_OF_STOCK": CartItem.UnavailableReason.OUT_OF_STOCK,
         }
         unavailable_reason = reason_map.get(event)
-        if unavailable_reason:
-            CartItem.objects.filter(sku_id__in=sku_ids).update(unavailable_reason=unavailable_reason)
+        if not unavailable_reason:
+            return _error(
+                "Неподдерживаемый тип события",
+                "INVALID_EVENT",
+                status.HTTP_400_BAD_REQUEST,
+            )
+        CartItem.objects.filter(sku_id__in=sku_ids).update(unavailable_reason=unavailable_reason)
 
         ProductEventInbox.objects.create(
             idempotency_key=idempotency_key,
