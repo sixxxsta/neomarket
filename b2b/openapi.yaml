@@ -380,7 +380,14 @@ paths:
   /api/v1/fulfill:
     post:
       tags: [SKU]
-      summary: Финально списать резерв после доставки
+      operationId: b2b_fulfill_inventory
+      summary: Финально списать резерв после доставки (идемпотентно по order_id)
+      description: |
+        Межсервисный вызов B2C→B2B (`X-Service-Key`) при доставке заказа. Уменьшает только
+        `reserved_quantity`; `active_quantity` не меняется (товар уже у покупателя). Идемпотентность
+        по `order_id` — повторный retry B2C возвращает 200 без повторного списания (InventoryOperation).
+      security:
+        - ServiceKeyAuth: []
       requestBody:
         required: true
         content:
@@ -389,11 +396,21 @@ paths:
               $ref: "#/components/schemas/FulfillRequest"
       responses:
         "200":
-          description: Резерв списан
+          description: Резерв списан (или идемпотентный повтор)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/InventoryOperationResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Списать больше, чем зарезервировано
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/v1/events/moderation:
     post:
@@ -1258,6 +1275,7 @@ components:
       properties:
         order_id:
           type: string
+          description: Идентификатор заказа B2C (ключ идемпотентности fulfill)
         items:
           type: array
           minItems: 1

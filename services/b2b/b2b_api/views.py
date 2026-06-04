@@ -1073,10 +1073,7 @@ class FulfillView(APIView):
 
         requested_items = serializer.validated_data['items']
         sku_ids = [row['sku_id'] for row in requested_items]
-        sku_map = {
-            sku.id: sku
-            for sku in Sku.objects.select_for_update().select_related('product').filter(id__in=sku_ids, deleted=False).order_by('id')
-        }
+        sku_map = _lock_skus_for_inventory(sku_ids)
         if len(sku_map) != len(set(sku_ids)):
             return _error('BAD_REQUEST', 'One or more SKU ids are invalid', status.HTTP_400_BAD_REQUEST)
 
@@ -1099,7 +1096,13 @@ class FulfillView(APIView):
             )
 
         payload = _inventory_operation_response(response_items, 'Fulfill applied')
-        InventoryOperation.objects.create(key=key, kind=InventoryOperation.Kind.FULFILL, payload=payload)
+        try:
+            InventoryOperation.objects.create(key=key, kind=InventoryOperation.Kind.FULFILL, payload=payload)
+        except IntegrityError:
+            existing = InventoryOperation.objects.filter(key=key).first()
+            if existing and existing.kind == InventoryOperation.Kind.FULFILL:
+                return Response(existing.payload)
+            raise
         return Response(payload)
 
 
