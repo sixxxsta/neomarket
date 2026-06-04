@@ -777,7 +777,21 @@ components:
 
     Sku:
       type: object
-      required: [id, product_id, name, price, cost_price, active_quantity, reserved_quantity, images, deleted]
+      required:
+        - id
+        - product_id
+        - name
+        - price
+        - discount
+        - cost_price
+        - stock_quantity
+        - active_quantity
+        - reserved_quantity
+        - article
+        - images
+        - characteristics
+        - created_at
+        - updated_at
       properties:
         id:
           type: string
@@ -793,15 +807,26 @@ components:
           type: integer
           minimum: 0
           description: Цена в копейках
+        discount:
+          type: integer
+          minimum: 0
+          description: Скидка в копейках
         cost_price:
           type: integer
           minimum: 0
+        stock_quantity:
+          type: integer
+          minimum: 0
+          description: Всего на складе (active + reserved)
         active_quantity:
           type: integer
           minimum: 0
         reserved_quantity:
           type: integer
           minimum: 0
+        article:
+          type: string
+          nullable: true
         images:
           type: array
           items:
@@ -812,6 +837,12 @@ components:
             $ref: "#/components/schemas/Characteristic"
         deleted:
           type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
 
     Product:
       type: object
