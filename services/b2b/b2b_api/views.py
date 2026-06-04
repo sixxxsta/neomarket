@@ -9,6 +9,7 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from jwt import InvalidTokenError
 from rest_framework import serializers, status
+from rest_framework.settings import api_settings
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -52,7 +53,7 @@ def _format_error_message(message):
         for field, errors in message.items():
             if isinstance(errors, list):
                 for error in errors:
-                    if field in (serializers.NON_FIELD_ERRORS, '__all__'):
+                    if field in (api_settings.NON_FIELD_ERRORS_KEY, '__all__'):
                         parts.append(str(error))
                     else:
                         parts.append(f'{field}: {error}')
@@ -771,7 +772,7 @@ class SkuMutationView(APIView):
             name=serializer.validated_data['name'],
             price=serializer.validated_data['price'],
             cost_price=serializer.validated_data.get('cost_price', 0),
-            active_quantity=serializer.validated_data['active_quantity'],
+            active_quantity=serializer.validated_data.get('active_quantity', 0),
             images=serializer.validated_data.get('images', []),
             characteristics=serializer.validated_data.get('characteristics', []),
         )
