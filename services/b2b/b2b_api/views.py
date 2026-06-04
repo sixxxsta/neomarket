@@ -744,6 +744,7 @@ class SkuMutationView(APIView):
             return _error('FORBIDDEN', 'Cannot add SKU to HARD_BLOCKED product', status.HTTP_403_FORBIDDEN)
 
         first_live_sku = not product.skus.filter(deleted=False).exists()
+        previous_status = product.status
         snapshot_before = _serialize_product_snapshot(product)
 
         sku = Sku.objects.create(
@@ -758,6 +759,8 @@ class SkuMutationView(APIView):
 
         if first_live_sku:
             _set_product_on_moderation(product, snapshot_before=snapshot_before, lifecycle_event='CREATED')
+        elif previous_status in {Product.Status.MODERATED, Product.Status.BLOCKED}:
+            _set_product_on_moderation(product, snapshot_before=snapshot_before, lifecycle_event='EDITED')
 
         return Response(SkuSerializer(sku).data, status=status.HTTP_201_CREATED)
 
