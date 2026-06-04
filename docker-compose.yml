@@ -1,0 +1,794 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: neomarket-postgres
+    environment:
+      POSTGRES_USER: neomarket
+      POSTGRES_PASSWORD: neomarket
+      POSTGRES_DB: neomarket
+    ports:
+    - 5432:5432
+    volumes:
+    - postgres_data:/var/lib/postgresql/data
+    - ./infra/postgres/init-multiple-dbs.sql:/docker-entrypoint-initdb.d/init-multiple-dbs.sql:ro
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U neomarket
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  redis:
+    image: redis:7-alpine
+    container_name: neomarket-redis
+    ports:
+    - 6379:6379
+    healthcheck:
+      test:
+      - CMD
+      - redis-cli
+      - ping
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  catalog:
+    build:
+      context: ./services/catalog
+    container_name: neomarket-catalog
+    command: sh -c "python manage.py migrate && python manage.py sync_b2b_catalog
+      && python manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: catalog_service.settings
+      SECRET_KEY: catalog-dev-secret
+      DEBUG: '1'
+      DB_NAME: catalog_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      REDIS_URL: redis://redis:6379/0
+      INTERNAL_SERVICE_KEY: neomarket-internal-key
+      B2B_PRODUCTS_URL: http://b2b:8000/api/v1/products
+      B2B_TIMEOUT: '5.0'
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/catalog:/app
+    - ./infra:/app/infra:ro
+    ports:
+    - 8001:8000
+    depends_on:
+      b2b:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  cart:
+    build:
+      context: ./services/cart
+    container_name: neomarket-cart
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: cart_service.settings
+      SECRET_KEY: cart-dev-secret
+      DEBUG: '1'
+      DB_NAME: cart_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      REDIS_URL: redis://redis:6379/0
+      CATALOG_PRODUCTS_URL: http://catalog:8000/api/v1/products
+      CATALOG_TIMEOUT: '3.0'
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/3
+      JWT_ALGORITHM: HS256
+      JWT_SECRET: auth-signing-secret
+      JWT_ISSUER: https://auth.neomarket.local
+      JWT_AUDIENCE: neomarket-services
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/cart:/app
+    - ./infra:/app/infra:ro
+    ports:
+    - 8002:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  orders:
+    build:
+      context: ./services/orders
+    container_name: neomarket-orders
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: orders_service.settings
+      SECRET_KEY: orders-dev-secret
+      DEBUG: '1'
+      DB_NAME: orders_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/4
+      CELERY_RESULT_BACKEND: redis://redis:6379/5
+      CART_VALIDATE_URL: http://cart:8000/api/v1/cart/validate
+      CART_VALIDATE_TIMEOUT: '3.0'
+      JWT_ALGORITHM: HS256
+      JWT_SECRET: auth-signing-secret
+      JWT_ISSUER: https://auth.neomarket.local
+      JWT_AUDIENCE: neomarket-services
+      EVENT_STREAM: neomarket.events
+      EVENT_GROUP: orders
+      EVENT_CONSUMER: orders-1
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/orders:/app
+    - ./infra:/app/infra:ro
+    ports:
+    - 8003:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  moderation:
+    build:
+      context: ./services/moderation
+    container_name: neomarket-moderation
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: moderation_service.settings
+      SECRET_KEY: moderation-dev-secret
+      DEBUG: '1'
+      DB_NAME: moderation_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      REDIS_URL: redis://redis:6379/0
+      B2B_PRODUCT_URL_TEMPLATE: ''
+      B2B_MODERATION_EVENTS_URL: http://b2b:8000/api/v1/moderation/events
+      B2B_REQUEST_TIMEOUT: '3.0'
+      INTERNAL_SERVICE_KEY: neomarket-internal-key
+      MODERATION_EVENTS_STREAM: neomarket.events
+      MODERATION_EVENTS_GROUP: moderation
+      MODERATION_EVENTS_CONSUMER: moderation-api
+      JWT_ALGORITHM: HS256
+      JWT_SECRET: auth-signing-secret
+      JWT_ISSUER: https://auth.neomarket.local
+      JWT_AUDIENCE: neomarket-services
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/moderation:/app
+    - ./infra:/app/infra:ro
+    ports:
+    - 8004:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  moderation-worker:
+    build:
+      context: ./services/moderation
+    container_name: neomarket-moderation-worker
+    command: python manage.py consume_b2b_events
+    environment:
+      DJANGO_SETTINGS_MODULE: moderation_service.settings
+      SECRET_KEY: moderation-dev-secret
+      DEBUG: '1'
+      DB_NAME: moderation_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      REDIS_URL: redis://redis:6379/0
+      B2B_PRODUCT_URL_TEMPLATE: ''
+      B2B_REQUEST_TIMEOUT: '3.0'
+      MODERATION_EVENTS_STREAM: neomarket.events
+      MODERATION_EVENTS_GROUP: moderation
+      MODERATION_EVENTS_CONSUMER: moderation-worker
+      JWT_ALGORITHM: HS256
+      JWT_SECRET: auth-signing-secret
+      JWT_ISSUER: https://auth.neomarket.local
+      JWT_AUDIENCE: neomarket-services
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/moderation:/app
+    - ./infra:/app/infra:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  b2b:
+    build:
+      context: ./services/b2b
+    container_name: neomarket-b2b
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: b2b_service.settings
+      SECRET_KEY: b2b-dev-secret
+      DEBUG: '1'
+      DB_NAME: b2b_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      JWT_ALGORITHM: HS256
+      JWT_SECRET: auth-signing-secret
+      JWT_ISSUER: https://auth.neomarket.local
+      JWT_AUDIENCE: neomarket-services
+      EVENT_STREAM: neomarket.events
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/b2b:/app
+    - ./infra:/app/infra:ro
+    ports:
+    - 8005:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  auth:
+    build:
+      context: ./services/auth
+    container_name: neomarket-auth
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: auth_service.settings
+      SECRET_KEY: auth-dev-secret
+      DEBUG: '1'
+      DB_NAME: auth_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      JWT_ISSUER: https://auth.neomarket.local
+      JWT_ALGORITHM: HS256
+      JWT_SIGNING_KEY: auth-signing-secret
+      JWT_AUDIENCE_DEFAULT: neomarket-services
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/auth:/app
+    - ./infra:/app/infra:ro
+    ports:
+    - 8006:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+  payments:
+    build:
+      context: ./services/payments
+    container_name: neomarket-payments
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: payments_service.settings
+      SECRET_KEY: payments-dev-secret
+      DEBUG: '1'
+      DB_NAME: payments_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      REDIS_URL: redis://redis:6379/0
+      EVENT_STREAM: neomarket.events
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/payments:/app
+    - ./infra:/app/infra:ro
+    ports:
+    - 8007:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  payments-outbox:
+    build:
+      context: ./services/payments
+    container_name: neomarket-payments-outbox
+    command: sh -c "while true; do python manage.py publish_outbox;
+      sleep 2; done"
+    environment:
+      DJANGO_SETTINGS_MODULE: payments_service.settings
+      SECRET_KEY: payments-dev-secret
+      DEBUG: '1'
+      DB_NAME: payments_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      REDIS_URL: redis://redis:6379/0
+      EVENT_STREAM: neomarket.events
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/payments:/app
+    - ./infra:/app/infra:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  logistics:
+    build:
+      context: ./services/logistics
+    container_name: neomarket-logistics
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: logistics_service.settings
+      SECRET_KEY: logistics-dev-secret
+      DEBUG: '1'
+      DB_NAME: logistics_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/logistics:/app
+    - ./infra:/app/infra:ro
+    ports:
+    - 8008:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+  reviews:
+    build:
+      context: ./services/reviews
+    container_name: neomarket-reviews
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: reviews_service.settings
+      SECRET_KEY: reviews-dev-secret
+      DEBUG: '1'
+      DB_NAME: reviews_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/reviews:/app
+    - ./infra:/app/infra:ro
+    ports:
+    - 8009:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+  promo:
+    build:
+      context: ./services/promo
+    container_name: neomarket-promo
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: promo_service.settings
+      SECRET_KEY: promo-dev-secret
+      DEBUG: '1'
+      DB_NAME: promo_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/promo:/app
+    - ./infra:/app/infra:ro
+    ports:
+    - 8010:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+  antifraud:
+    build:
+      context: ./services/antifraud
+    container_name: neomarket-antifraud
+    command: sh -c "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: antifraud_service.settings
+      SECRET_KEY: antifraud-dev-secret
+      DEBUG: '1'
+      DB_NAME: antifraud_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/antifraud:/app
+    - ./infra:/app/infra:ro
+    ports:
+    - 8011:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+  b2b-outbox:
+    build:
+      context: ./services/b2b
+    container_name: neomarket-b2b-outbox
+    command: sh -c "while true; do python manage.py publish_outbox_events;
+      sleep 2; done"
+    environment:
+      DJANGO_SETTINGS_MODULE: b2b_service.settings
+      SECRET_KEY: b2b-dev-secret
+      DEBUG: '1'
+      DB_NAME: b2b_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      REDIS_URL: redis://redis:6379/0
+      EVENT_STREAM: neomarket.events
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/b2b:/app
+    - ./infra:/app/infra:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  b2b-moderation-consumer:
+    build:
+      context: ./services/b2b
+    container_name: neomarket-b2b-moderation-consumer
+    command: python manage.py consume_moderation_events
+    environment:
+      DJANGO_SETTINGS_MODULE: b2b_service.settings
+      SECRET_KEY: b2b-dev-secret
+      DEBUG: '1'
+      DB_NAME: b2b_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      REDIS_URL: redis://redis:6379/0
+      EVENT_STREAM: neomarket.events
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/b2b:/app
+    - ./infra:/app/infra:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  moderation-outbox:
+    build:
+      context: ./services/moderation
+    container_name: neomarket-moderation-outbox
+    command: sh -c "while true; do python manage.py publish_outbox_events;
+      sleep 2; done"
+    environment:
+      DJANGO_SETTINGS_MODULE: moderation_service.settings
+      SECRET_KEY: moderation-dev-secret
+      DEBUG: '1'
+      DB_NAME: moderation_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      REDIS_URL: redis://redis:6379/0
+      MODERATION_EVENTS_STREAM: neomarket.events
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/moderation:/app
+    - ./infra:/app/infra:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  catalog-projection:
+    build:
+      context: ./services/catalog
+    container_name: neomarket-catalog-projection
+    command: python manage.py consume_domain_events
+    environment:
+      DJANGO_SETTINGS_MODULE: catalog_service.settings
+      SECRET_KEY: catalog-dev-secret
+      DEBUG: '1'
+      DB_NAME: catalog_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      REDIS_URL: redis://redis:6379/0
+      EVENT_STREAM: neomarket.events
+      EVENT_GROUP: catalog
+      EVENT_CONSUMER: catalog-projection
+    volumes:
+    - ./services/catalog:/app
+    - ./infra:/app/infra:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  orders-consumer:
+    build:
+      context: ./services/orders
+    container_name: neomarket-orders-consumer
+    command: python manage.py consume_domain_events
+    environment:
+      DJANGO_SETTINGS_MODULE: orders_service.settings
+      SECRET_KEY: orders-dev-secret
+      DEBUG: '1'
+      DB_NAME: orders_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      REDIS_URL: redis://redis:6379/0
+      EVENT_STREAM: neomarket.events
+      EVENT_GROUP: orders
+      EVENT_CONSUMER: orders-consumer
+    volumes:
+    - ./services/orders:/app
+    - ./infra:/app/infra:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  orders-outbox:
+    build:
+      context: ./services/orders
+    container_name: neomarket-orders-outbox
+    command: sh -c "while true; do python manage.py publish_outbox_events;
+      sleep 2; done"
+    environment:
+      DJANGO_SETTINGS_MODULE: orders_service.settings
+      SECRET_KEY: orders-dev-secret
+      DEBUG: '1'
+      DB_NAME: orders_db
+      DB_USER: neomarket
+      DB_PASSWORD: neomarket
+      DB_HOST: postgres
+      DB_PORT: '5432'
+      REDIS_URL: redis://redis:6379/0
+      EVENT_STREAM: neomarket.events
+      OTEL_ENABLED: 'true'
+      JAEGER_ENABLED: 'true'
+      JAEGER_HOST: jaeger:6831
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      LOG_LEVEL: DEBUG
+    volumes:
+    - ./services/orders:/app
+    - ./infra:/app/infra:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  api_gateway:
+    build:
+      context: ./
+      dockerfile: ./infra/Dockerfile.gateway
+    container_name: neomarket-api-gateway
+    ports:
+    - 8888:80
+    volumes:
+    - ./infra/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    environment:
+      NGINX_HOST: api.neomarket.local
+      NGINX_PORT: 80
+    depends_on:
+    - b2b
+    - payments
+    - logistics
+    - reviews
+    - promo
+    - catalog
+    - moderation
+    - orders
+    - cart
+    - auth
+    - antifraud
+    healthcheck:
+      test:
+      - CMD
+      - wget
+      - -q
+      - -O-
+      - http://localhost/health
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: neomarket-jaeger
+    ports:
+    - 6831:6831/udp
+    - 16686:16686
+    - 4317:4317
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl -f http://localhost:14269/ || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: neomarket-prometheus
+    command:
+    - --config.file=/etc/prometheus/prometheus.yml
+    - --storage.tsdb.path=/prometheus
+    - --web.console.libraries=/usr/share/prometheus/console_libraries
+    - --web.console.templates=/usr/share/prometheus/consoles
+    ports:
+    - 9090:9090
+    volumes:
+    - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    - prometheus_data:/prometheus
+    healthcheck:
+      test:
+      - CMD
+      - wget
+      - --spider
+      - -q
+      - http://localhost:9090/-/healthy
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+    - jaeger
+  grafana:
+    image: grafana/grafana:latest
+    container_name: neomarket-grafana
+    ports:
+    - 3000:3000
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: grafana-piechart-panel,grafana-worldmap-panel
+    volumes:
+    - grafana_data:/var/lib/grafana
+    - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl -f http://localhost:3000/api/health || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+    - prometheus
+  loki:
+    image: grafana/loki:latest
+    container_name: neomarket-loki
+    ports:
+    - 3100:3100
+    volumes:
+    - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl -f http://localhost:3100/ready || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  b2b-cabinet:
+    build:
+      context: ./frontend/apps/b2b-cabinet
+    container_name: neomarket-b2b-cabinet
+    ports:
+    - 5176:80
+    depends_on:
+    - api_gateway
+    - b2b
+    - auth
+    - catalog
+    environment:
+      VITE_API_URL: http://localhost:8888/api/v1
+    healthcheck:
+      test:
+      - CMD
+      - wget
+      - -q
+      - -O-
+      - http://localhost/
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  frontend:
+    build:
+      context: ./frontend
+    container_name: neomarket-frontend
+    ports:
+    - 8080:80
+    depends_on:
+    - catalog
+    - cart
+    - orders
+    - moderation
+    - moderation-worker
+    - b2b
+    - auth
+    - payments
+    - logistics
+    - reviews
+    - promo
+    - antifraud
+    - prometheus
+    - grafana
+    - jaeger
+volumes:
+  postgres_data: null
+  prometheus_data: null
+  grafana_data: null
+  loki_data: null

@@ -1,4 +1,5 @@
 from datetime import timedelta
+from unittest.mock import patch
 from uuid import uuid4
 
 import json
@@ -30,15 +31,22 @@ class ModerationApiTests(TestCase):
         token = build_test_token()
         self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {token}')
 
-    def test_get_next_and_approve(self):
+    @patch('moderation_api.approve.post_moderation_decision', return_value=((200, {}), None))
+    def test_get_next_and_approve(self, _mock_b2b):
         product_id = str(uuid4())
+        sku_id = str(uuid4())
 
         enqueue = self.client.post(
             '/api/v1/product-moderation/enqueue',
             {
                 'product_id': product_id,
                 'event_type': 'CREATED',
-                'snapshot_after': {'id': product_id, 'title': 'Demo'},
+                'snapshot_after': {
+                    'id': product_id,
+                    'title': 'Demo',
+                    'status': 'ON_MODERATION',
+                    'skus': [{'id': sku_id, 'deleted': False}],
+                },
             },
             format='json',
         )
@@ -53,7 +61,8 @@ class ModerationApiTests(TestCase):
         self.assertEqual(approve.data['status'], 'MODERATED')
         event = ModerationEvent.objects.get(product_id=product_id)
         self.assertEqual(event.event_type, ModerationEvent.EventType.PRODUCT_APPROVED)
-        self.assertTrue(event.payload['idempotency_key'])
+        self.assertTrue(event.payload['idempotency_key'].startswith('approve:'))
+        _mock_b2b.assert_called_once()
 
     def test_parse_event_product_id_from_aggregate_id(self):
         pid = str(uuid4())
@@ -131,17 +140,21 @@ class ModerationApiTests(TestCase):
         self.assertIsNone(dropped)
         self.assertFalse(ModerationCard.objects.filter(product_id=product_id).exists())
 
-    def test_approve_closes_all_open_duplicates_for_same_product(self):
+    def test_approve_requires_in_review_card(self):
         product_id = str(uuid4())
-        ModerationCard.objects.create(product_id=product_id, event_type='CREATED', snapshot_after={'id': product_id, 'status': 'ON_MODERATION', 'skus': [{'id': str(uuid4())}]})
-        ModerationCard.objects.create(product_id=product_id, event_type='UPDATED', snapshot_after={'id': product_id, 'status': 'ON_MODERATION', 'skus': [{'id': str(uuid4())}]})
+        ModerationCard.objects.create(
+            product_id=product_id,
+            event_type='CREATED',
+            queue_status=ModerationCard.QueueStatus.PENDING,
+            snapshot_after={
+                'id': product_id,
+                'status': 'ON_MODERATION',
+                'skus': [{'id': str(uuid4()), 'deleted': False}],
+            },
+        )
 
         approve = self.client.post(f'/api/v1/products/{product_id}/approve', {}, format='json')
-        self.assertEqual(approve.status_code, 200)
-        self.assertEqual(
-            ModerationCard.objects.filter(product_id=product_id, queue_status=ModerationCard.QueueStatus.APPROVED).count(),
-            2,
-        )
+        self.assertEqual(approve.status_code, 404)
 
 
 class ProductEventsApiTests(TestCase):
@@ -347,3 +360,106 @@ class GetNextApiTests(TestCase):
         second = client.post('/api/v1/product-moderation/get-next', {}, format='json')
         self.assertEqual(second.status_code, 409)
         self.assertEqual(second.data['code'], 'MODERATOR_ALREADY_HAS_CARD')
+
+
+class ApproveProductApiTests(TestCase):
+    def _client_for(self, moderator_id):
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Bearer {build_test_token(moderator_id)}')
+        return client
+
+    def _in_review_card(self, product_id=None, moderator_id=None, snapshot=None):
+        product_id = product_id or uuid4()
+        moderator_id = moderator_id or uuid4()
+        now = timezone.now()
+        card = ModerationCard.objects.create(
+            product_id=product_id,
+            event_type=ModerationCard.EventType.CREATED,
+            queue_status=ModerationCard.QueueStatus.IN_REVIEW,
+            assigned_to=str(moderator_id),
+            review_started_at=now,
+            snapshot_after=snapshot
+            or {
+                'id': str(product_id),
+                'status': 'ON_MODERATION',
+                'skus': [{'id': str(uuid4()), 'deleted': False}],
+            },
+        )
+        ModerationCard.objects.filter(pk=card.pk).update(updated_at=now)
+        card.refresh_from_db()
+        return card, moderator_id
+
+    @patch('moderation_api.approve.post_moderation_decision', return_value=((200, {}), None))
+    def test_approve_transitions_to_moderated_and_emits_event(self, mock_b2b):
+        card, moderator_id = self._in_review_card()
+        client = self._client_for(moderator_id)
+
+        response = client.post(f'/api/v1/products/{card.product_id}/approve', {}, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['status'], 'MODERATED')
+
+        card.refresh_from_db()
+        self.assertEqual(card.queue_status, ModerationCard.QueueStatus.APPROVED)
+
+        event = ModerationEvent.objects.get(product_id=card.product_id)
+        self.assertEqual(event.event_type, ModerationEvent.EventType.PRODUCT_APPROVED)
+        self.assertTrue(event.published)
+        self.assertEqual(event.payload['status'], 'MODERATED')
+        self.assertEqual(event.payload['idempotency_key'], f'approve:{card.id}')
+
+        mock_b2b.assert_called_once()
+        payload = mock_b2b.call_args[0][0]
+        self.assertEqual(payload['status'], 'MODERATED')
+        self.assertEqual(payload['product_id'], str(card.product_id))
+
+    def test_approve_others_card_returns_403(self):
+        owner = uuid4()
+        intruder = uuid4()
+        card, _ = self._in_review_card(moderator_id=owner)
+        client = self._client_for(intruder)
+
+        response = client.post(f'/api/v1/products/{card.product_id}/approve', {}, format='json')
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data['code'], 'APPROVE_NOT_ASSIGNED')
+        card.refresh_from_db()
+        self.assertEqual(card.queue_status, ModerationCard.QueueStatus.IN_REVIEW)
+
+    def test_approve_after_edited_returns_409(self):
+        card, moderator_id = self._in_review_card()
+        client = self._client_for(moderator_id)
+
+        enqueue_from_event(
+            {
+                'source': 'b2b',
+                'product_id': str(card.product_id),
+                'event_type': 'EDITED',
+                'snapshot_after': {
+                    'id': str(card.product_id),
+                    'status': 'ON_MODERATION',
+                    'title': 'Seller changed title',
+                    'skus': [{'id': str(uuid4()), 'deleted': False}],
+                },
+            }
+        )
+        card.refresh_from_db()
+        self.assertGreater(card.updated_at, card.review_started_at)
+
+        response = client.post(f'/api/v1/products/{card.product_id}/approve', {}, format='json')
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data['code'], 'APPROVE_AFTER_EDITED')
+
+    def test_approve_without_sku_returns_409(self):
+        product_id = uuid4()
+        card, moderator_id = self._in_review_card(
+            product_id=product_id,
+            snapshot={
+                'id': str(product_id),
+                'status': 'ON_MODERATION',
+                'skus': [],
+            },
+        )
+        client = self._client_for(moderator_id)
+
+        response = client.post(f'/api/v1/products/{card.product_id}/approve', {}, format='json')
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data['code'], 'APPROVE_WITHOUT_SKU')

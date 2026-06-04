@@ -79,6 +79,10 @@ SPECTACULAR_SETTINGS = {
 }
 
 B2B_PRODUCT_URL_TEMPLATE = os.getenv('B2B_PRODUCT_URL_TEMPLATE', '')
+B2B_MODERATION_EVENTS_URL = os.getenv(
+    'B2B_MODERATION_EVENTS_URL',
+    'http://b2b:8000/api/v1/moderation/events',
+)
 B2B_REQUEST_TIMEOUT = float(os.getenv('B2B_REQUEST_TIMEOUT', '3.0'))
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 MODERATION_EVENTS_STREAM = os.getenv('MODERATION_EVENTS_STREAM', 'neomarket.events')
