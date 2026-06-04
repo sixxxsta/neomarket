@@ -98,6 +98,10 @@ def _validate_approve(card, moderator):
 
 @transaction.atomic
 def approve_product(product_id, moderator):
+    from .terminal import assert_product_not_hard_blocked
+
+    assert_product_not_hard_blocked(product_id, ApproveError)
+
     card = _get_in_review_card(product_id)
     _validate_approve(card, moderator)
 

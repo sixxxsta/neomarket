@@ -587,15 +587,187 @@ class SoftBlockApiTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data['code'], 'INVALID_FIELD_NAME')
 
-    def test_soft_block_hard_only_reason_returns_400(self):
+    def test_soft_block_soft_reason_on_decline_stays_soft(self):
+        card, moderator_id = self._in_review_card()
+        client = self._client_for(moderator_id)
+
+        with patch('moderation_api.soft_block.post_moderation_decision', return_value=((200, {}), None)):
+            response = client.post(
+                f'/api/v1/products/{card.product_id}/decline',
+                self._decline_payload(reason_code='BAD_MEDIA'),
+                format='json',
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['status'], 'BLOCKED')
+        self.assertFalse(response.data['hard_block'])
+        card.refresh_from_db()
+        self.assertEqual(card.queue_status, ModerationCard.QueueStatus.DECLINED)
+
+
+class HardBlockApiTests(TestCase):
+    def _client_for(self, moderator_id):
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Bearer {build_test_token(moderator_id)}')
+        return client
+
+    def _in_review_card(self, product_id=None, moderator_id=None):
+        product_id = product_id or uuid4()
+        moderator_id = moderator_id or uuid4()
+        now = timezone.now()
+        card = ModerationCard.objects.create(
+            product_id=product_id,
+            event_type=ModerationCard.EventType.CREATED,
+            queue_status=ModerationCard.QueueStatus.IN_REVIEW,
+            assigned_to=str(moderator_id),
+            review_started_at=now,
+            snapshot_after={
+                'id': str(product_id),
+                'status': 'ON_MODERATION',
+                'skus': [{'id': str(uuid4()), 'deleted': False}],
+            },
+        )
+        ModerationCard.objects.filter(pk=card.pk).update(updated_at=now)
+        card.refresh_from_db()
+        return card, moderator_id
+
+    def _hard_decline_payload(self, **extra):
+        payload = {
+            'blocking_reason_id': 'FORBIDDEN_CONTENT',
+            'comment': 'Counterfeit listing',
+            'field_reports': [{'field_name': 'title', 'message': 'Prohibited item'}],
+        }
+        payload.update(extra)
+        return payload
+
+    @patch('moderation_api.hard_block.post_moderation_decision', return_value=((200, {}), None))
+    def test_hard_block_transitions_to_terminal_and_emits_event(self, mock_b2b):
         card, moderator_id = self._in_review_card()
         client = self._client_for(moderator_id)
 
         response = client.post(
             f'/api/v1/products/{card.product_id}/decline',
-            self._decline_payload(reason_code='FORBIDDEN_CONTENT'),
+            self._hard_decline_payload(),
             format='json',
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.data['code'], 'HARD_REASON_REQUIRES_HARD_BLOCK')
-        self.assertTrue(BlockingReason.objects.get(code='FORBIDDEN_CONTENT').hard_only)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['status'], 'HARD_BLOCKED')
+        self.assertTrue(response.data['hard_block'])
+
+        card.refresh_from_db()
+        self.assertEqual(card.queue_status, ModerationCard.QueueStatus.HARD_BLOCKED)
+        self.assertEqual(card.snapshot_after['status'], 'HARD_BLOCKED')
+
+        event = ModerationEvent.objects.get(product_id=card.product_id)
+        self.assertTrue(event.published)
+        mock_b2b.assert_called_once()
+
+    @patch('moderation_api.hard_block.post_moderation_decision', return_value=((200, {}), None))
+    def test_hard_block_event_carries_hard_block_true(self, mock_b2b):
+        card, moderator_id = self._in_review_card()
+        client = self._client_for(moderator_id)
+
+        client.post(f'/api/v1/products/{card.product_id}/decline', self._hard_decline_payload(), format='json')
+
+        payload = mock_b2b.call_args[0][0]
+        self.assertEqual(payload['status'], 'BLOCKED')
+        self.assertTrue(payload['hard_block'])
+        self.assertEqual(payload['idempotency_key'], f'hard-block:{card.id}')
+
+    def test_any_modify_on_hard_blocked_returns_403(self):
+        card, moderator_id = self._in_review_card()
+        client = self._client_for(moderator_id)
+
+        ModerationCard.objects.filter(pk=card.pk).update(
+            queue_status=ModerationCard.QueueStatus.HARD_BLOCKED,
+            assigned_to=None,
+            review_started_at=None,
+        )
+
+        approve = client.post(f'/api/v1/products/{card.product_id}/approve', {}, format='json')
+        self.assertEqual(approve.status_code, 403)
+        self.assertEqual(approve.data['code'], 'HARD_BLOCKED_TERMINAL')
+
+        decline = client.post(
+            f'/api/v1/products/{card.product_id}/decline',
+            self._hard_decline_payload(),
+            format='json',
+        )
+        self.assertEqual(decline.status_code, 403)
+
+        enqueue = client.post(
+            '/api/v1/product-moderation/enqueue',
+            {
+                'product_id': str(card.product_id),
+                'event_type': 'EDITED',
+                'snapshot_after': {'id': str(card.product_id), 'status': 'ON_MODERATION', 'skus': [{'id': str(uuid4()), 'deleted': False}]},
+            },
+            format='json',
+        )
+        self.assertEqual(enqueue.status_code, 403)
+
+    def test_edited_event_on_hard_blocked_is_ignored(self):
+        product_id = uuid4()
+        card = ModerationCard.objects.create(
+            product_id=product_id,
+            event_type=ModerationCard.EventType.CREATED,
+            queue_status=ModerationCard.QueueStatus.HARD_BLOCKED,
+            snapshot_after={'id': str(product_id), 'status': 'HARD_BLOCKED', 'title': 'Blocked'},
+        )
+        client = APIClient()
+        response = client.post(
+            '/api/v1/events/product',
+            {
+                'idempotency_key': 'evt-edited-hard-1',
+                'product_id': str(product_id),
+                'event_type': 'EDITED',
+                'snapshot_after': {
+                    'id': str(product_id),
+                    'status': 'ON_MODERATION',
+                    'title': 'Seller tried to edit',
+                    'skus': [{'id': str(uuid4()), 'deleted': False}],
+                },
+            },
+            format='json',
+            HTTP_X_SERVICE_KEY=settings.INTERNAL_SERVICE_KEY,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data['accepted'])
+        self.assertNotIn('card_id', response.data)
+
+        card.refresh_from_db()
+        self.assertEqual(card.queue_status, ModerationCard.QueueStatus.HARD_BLOCKED)
+        self.assertEqual(card.snapshot_after['title'], 'Blocked')
+
+    def test_deleted_event_removes_hard_blocked(self):
+        product_id = uuid4()
+        ModerationCard.objects.create(
+            product_id=product_id,
+            event_type=ModerationCard.EventType.CREATED,
+            queue_status=ModerationCard.QueueStatus.HARD_BLOCKED,
+            snapshot_after={'id': str(product_id), 'status': 'HARD_BLOCKED'},
+        )
+        client = APIClient()
+        response = client.post(
+            '/api/v1/events/product',
+            {
+                'idempotency_key': 'evt-deleted-hard-1',
+                'product_id': str(product_id),
+                'event_type': 'DELETED',
+                'snapshot_after': {'id': str(product_id), 'deleted': True},
+            },
+            format='json',
+            HTTP_X_SERVICE_KEY=settings.INTERNAL_SERVICE_KEY,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(
+            ModerationCard.objects.filter(
+                product_id=product_id,
+                queue_status=ModerationCard.QueueStatus.HARD_BLOCKED,
+            ).exists()
+        )
+        self.assertTrue(
+            ModerationCard.objects.filter(
+                product_id=product_id,
+                queue_status=ModerationCard.QueueStatus.ARCHIVED,
+            ).exists()
+        )

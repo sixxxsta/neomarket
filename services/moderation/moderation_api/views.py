@@ -3,7 +3,10 @@ from uuid import uuid4
 
 from django.db import transaction
 from .approve import ApproveError, approve_product
-from .soft_block import SoftBlockError, soft_block_product
+from .decline import DeclineError, decline_product
+from .hard_block import HardBlockError
+from .soft_block import SoftBlockError
+from .terminal import assert_product_not_hard_blocked
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from jwt import InvalidTokenError
@@ -116,6 +119,10 @@ class ModerationEnqueueView(APIView):
         from .queue import compute_priority_queue
 
         product_id = serializer.validated_data['product_id']
+        try:
+            assert_product_not_hard_blocked(product_id, DeclineError)
+        except DeclineError as exc:
+            return _error(exc.message, exc.code, exc.http_status)
         snapshot_after = serializer.validated_data.get('snapshot_after') or {'id': str(product_id)}
         card = ModerationCard.objects.create(
             product_id=product_id,
@@ -178,14 +185,14 @@ class ProductDeclineView(APIView):
             ]
 
         try:
-            result = soft_block_product(
+            result = decline_product(
                 id,
                 auth_context.actor,
                 serializer.validated_data['blocking_reason_id'],
                 comment=serializer.validated_data.get('comment', ''),
                 field_reports=field_reports,
             )
-        except SoftBlockError as exc:
+        except (DeclineError, SoftBlockError, HardBlockError) as exc:
             return _error(exc.message, exc.code, exc.http_status)
 
         return Response(result)
