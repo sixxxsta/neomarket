@@ -192,7 +192,7 @@ class OrdersApiTests(TestCase):
 
     @patch("orders_api.views.requests.get")
     @patch("orders_api.views.requests.post")
-    def test_cancel_order_moves_to_cancelled_on_successful_unreserve(self, mock_post, mock_get):
+    def test_cancel_paid_order_transitions_to_cancelled(self, mock_post, mock_get):
         mock_get.return_value = self._catalog_response()
         mock_post.side_effect = [
             self._inventory_response({"reserved": True, "items": [{"sku_id": str(self.sku_id), "reserved_quantity": 1}]}),
@@ -204,6 +204,50 @@ class OrdersApiTests(TestCase):
         canceled = self.client.post(f"/api/v1/orders/{order_id}/cancel", {}, format="json", HTTP_AUTHORIZATION=self.auth)
         self.assertEqual(canceled.status_code, 200)
         self.assertEqual(canceled.data["status"], "CANCELLED")
+        self.assertEqual(Order.objects.get(id=order_id).status, Order.Status.CANCELED)
+
+    @patch("orders_api.views.requests.get")
+    @patch("orders_api.views.requests.post")
+    def test_unreserve_failure_transitions_to_cancel_pending(self, mock_post, mock_get):
+        mock_get.return_value = self._catalog_response()
+        mock_post.side_effect = [
+            self._inventory_response({"reserved": True, "items": [{"sku_id": str(self.sku_id), "reserved_quantity": 1}]}),
+            requests.RequestException("connection refused"),
+        ]
+        created = self.client.post("/api/v1/orders", self._order_payload(), format="json", HTTP_AUTHORIZATION=self.auth)
+        order_id = created.data["id"]
+
+        canceled = self.client.post(f"/api/v1/orders/{order_id}/cancel", {}, format="json", HTTP_AUTHORIZATION=self.auth)
+        self.assertEqual(canceled.status_code, 200)
+        self.assertEqual(canceled.data["status"], "CANCEL_PENDING")
+        self.assertEqual(Order.objects.get(id=order_id).status, Order.Status.CANCEL_PENDING)
+
+    @patch("orders_api.views.requests.get")
+    @patch("orders_api.views.requests.post")
+    def test_cancel_assembling_order_returns_409(self, mock_post, mock_get):
+        created = self._create_order(mock_post, mock_get)
+        order_id = created.data["id"]
+        order = Order.objects.get(id=order_id)
+        order.status = Order.Status.ASSEMBLING
+        order.save(update_fields=["status"])
+
+        response = self.client.post(f"/api/v1/orders/{order_id}/cancel", {}, format="json", HTTP_AUTHORIZATION=self.auth)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data["code"], "CANCEL_NOT_ALLOWED")
+        self.assertEqual(response.data["current_status"], "ASSEMBLING")
+        self.assertEqual(Order.objects.get(id=order_id).status, Order.Status.ASSEMBLING)
+
+    @patch("orders_api.views.requests.get")
+    @patch("orders_api.views.requests.post")
+    def test_other_user_order_returns_404(self, mock_post, mock_get):
+        created = self._create_order(mock_post, mock_get)
+        order_id = created.data["id"]
+        other_auth = f"Bearer {_jwt_for_user(uuid.uuid4())}"
+
+        response = self.client.post(f"/api/v1/orders/{order_id}/cancel", {}, format="json", HTTP_AUTHORIZATION=other_auth)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data["code"], "ORDER_NOT_FOUND")
+        self.assertNotEqual(response.status_code, 403)
 
     @patch("orders_api.views.requests.get")
     @patch("orders_api.views.requests.post")
@@ -302,7 +346,7 @@ class OrdersApiTests(TestCase):
 
     @patch("orders_api.views.requests.get")
     @patch("orders_api.views.requests.post")
-    def test_other_user_order_returns_404_not_403(self, mock_post, mock_get):
+    def test_other_user_order_detail_returns_404_not_403(self, mock_post, mock_get):
         created = self._create_order(mock_post, mock_get)
         order_id = created.data["id"]
         other_auth = f"Bearer {_jwt_for_user(uuid.uuid4())}"
