@@ -1,0 +1,282 @@
+openapi: 3.0.3
+info:
+  title: NeoMarket Moderation
+  version: "1.0"
+  description: |
+    Модуль модерации товаров.
+
+    Логика работы:
+    1. Moderation узнает, что товар создан или изменен (временный ручной enqueue).
+    2. Запрашивает данные товара из B2B (если задан B2B_PRODUCT_URL_TEMPLATE).
+    3. Сохраняет снимок товара. Для UPDATED допускается before/after.
+    4. Модератор берет карточку из очереди и проверяет.
+    5. Одобряет или блокирует; событие решения фиксируется в outbox.
+
+paths:
+  /api/v1/events/product:
+    post:
+      summary: Приём событий о товаре от B2B
+      description: |
+        Server-to-server канал от B2B-синдиката. Требуется `X-Service-Key`.
+        Идемпотентность по `idempotency_key` (повтор → 200 без побочных эффектов).
+
+        События:
+        - `CREATED` — карточка в очереди `PENDING`
+        - `EDITED` / `UPDATED` — обновление снимков; после решения модерации возвращает в очередь
+        - `DELETED` — карточки архивируются (`ARCHIVED`), уходят из очереди
+      tags: [B2B Events]
+      security: []
+      parameters:
+        - name: X-Service-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProductLifecycleEvent"
+      responses:
+        "200":
+          description: Событие принято
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductEventAccepted"
+        "400":
+          description: Невалидный payload
+        "401":
+          description: Отсутствует или неверный X-Service-Key
+
+  /api/v1/product-moderation/get-next:
+    post:
+      summary: Следующая карточка из очереди
+      tags: [Queue]
+      responses:
+        "200":
+          description: Карточка для проверки
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModerationCard"
+        "204":
+          description: Очередь пуста
+
+  /api/v1/products/{id}/approve:
+    post:
+      summary: Одобрить товар
+      tags: [Decisions]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Товар одобрен, статус -> MODERATED
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  product_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    example: MODERATED
+        "404":
+          description: Товар не найден в очереди
+
+  /api/v1/products/{id}/decline:
+    post:
+      summary: Заблокировать товар с причиной
+      tags: [Decisions]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeclineRequest"
+      responses:
+        "200":
+          description: Товар заблокирован, статус -> BLOCKED
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  product_id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    example: BLOCKED
+                  reason:
+                    $ref: "#/components/schemas/DeclineReason"
+        "404":
+          description: Товар не найден в очереди
+
+  /api/v1/product-blocking-reasons:
+    get:
+      summary: Список причин блокировки
+      tags: [Reference]
+      responses:
+        "200":
+          description: Список причин
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BlockingReason"
+
+  /api/v1/product-moderation/enqueue:
+    post:
+      summary: Временный endpoint ручной постановки товара в очередь
+      tags: [Queue]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnqueueRequest"
+      responses:
+        "201":
+          description: Карточка добавлена в очередь
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModerationCard"
+
+components:
+  schemas:
+    ModerationCard:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+          enum: [CREATED, UPDATED, EDITED]
+        queue_status:
+          type: string
+          enum: [PENDING, IN_REVIEW, APPROVED, DECLINED, ARCHIVED]
+        snapshot_before:
+          type: object
+          nullable: true
+          additionalProperties: true
+        snapshot_after:
+          type: object
+          additionalProperties: true
+        assigned_to:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    BlockingReason:
+      type: object
+      properties:
+        code:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+
+    DeclineRequest:
+      type: object
+      required: [reason_code]
+      properties:
+        reason_code:
+          type: string
+        comment:
+          type: string
+        fields:
+          type: array
+          items:
+            type: string
+
+    DeclineReason:
+      type: object
+      properties:
+        code:
+          type: string
+        title:
+          type: string
+        comment:
+          type: string
+        fields:
+          type: array
+          items:
+            type: string
+
+    ProductLifecycleEvent:
+      type: object
+      required: [idempotency_key, product_id, event_type]
+      properties:
+        idempotency_key:
+          type: string
+          maxLength: 128
+        product_id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+          enum: [CREATED, EDITED, UPDATED, DELETED]
+        snapshot_before:
+          type: object
+          nullable: true
+          additionalProperties: true
+        snapshot_after:
+          type: object
+          nullable: true
+          additionalProperties: true
+
+    ProductEventAccepted:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+        card_id:
+          type: string
+          format: uuid
+          nullable: true
+
+    EnqueueRequest:
+      type: object
+      required: [product_id, event_type]
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+          enum: [CREATED, UPDATED, EDITED]
+        snapshot_before:
+          type: object
+          additionalProperties: true
+        snapshot_after:
+          type: object
+          additionalProperties: true
