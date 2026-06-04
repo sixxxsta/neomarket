@@ -1,12 +1,15 @@
 from rest_framework import serializers
 
+from .field_reports import FieldReportItemSerializer
 from .models import BlockingReason, ModerationCard
 
 
 class BlockingReasonSerializer(serializers.ModelSerializer):
+    blocking_reason_id = serializers.SlugField(source='code', read_only=True)
+
     class Meta:
         model = BlockingReason
-        fields = ['code', 'title', 'description']
+        fields = ['blocking_reason_id', 'code', 'title', 'description', 'hard_only']
 
 
 class ModerationCardSerializer(serializers.ModelSerializer):
@@ -27,9 +30,20 @@ class ModerationCardSerializer(serializers.ModelSerializer):
 
 
 class DeclineRequestSerializer(serializers.Serializer):
-    reason_code = serializers.SlugField(max_length=64)
-    comment = serializers.CharField(max_length=500, allow_blank=True, required=False)
+    blocking_reason_id = serializers.SlugField(max_length=64, required=False)
+    reason_code = serializers.SlugField(max_length=64, required=False)
+    comment = serializers.CharField(max_length=500, allow_blank=True, required=False, default='')
+    field_reports = FieldReportItemSerializer(many=True, required=False, allow_empty=True)
     fields = serializers.ListField(child=serializers.CharField(max_length=128), required=False, allow_empty=True)
+
+    def validate(self, attrs):
+        reason_id = attrs.get('blocking_reason_id') or attrs.get('reason_code')
+        if not reason_id:
+            raise serializers.ValidationError(
+                {'blocking_reason_id': 'blocking_reason_id or reason_code is required'}
+            )
+        attrs['blocking_reason_id'] = reason_id
+        return attrs
 
 
 class GetNextRequestSerializer(serializers.Serializer):

@@ -9,7 +9,7 @@ from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from .models import ModerationCard, ModerationEvent
+from .models import BlockingReason, ModerationCard, ModerationEvent
 from .queue import enqueue_from_event, parse_event
 
 
@@ -85,13 +85,24 @@ class ModerationApiTests(TestCase):
 
     def test_decline_requires_reason(self):
         product_id = str(uuid4())
+        moderator_id = uuid4()
         ModerationCard.objects.create(
             product_id=product_id,
             event_type='UPDATED',
-            snapshot_after={'id': product_id},
+            queue_status=ModerationCard.QueueStatus.IN_REVIEW,
+            assigned_to=str(moderator_id),
+            review_started_at=timezone.now(),
+            snapshot_after={'id': product_id, 'status': 'ON_MODERATION', 'skus': [{'id': str(uuid4()), 'deleted': False}]},
         )
-        decline = self.client.post(f'/api/v1/products/{product_id}/decline', {'reason_code': 'UNKNOWN'}, format='json')
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Bearer {build_test_token(moderator_id)}')
+        decline = client.post(
+            f'/api/v1/products/{product_id}/decline',
+            {'blocking_reason_id': 'UNKNOWN'},
+            format='json',
+        )
         self.assertEqual(decline.status_code, 400)
+        self.assertEqual(decline.data['code'], 'BLOCKING_REASON_NOT_FOUND')
 
     def test_stream_enqueue_refreshes_existing_open_card_and_drops_non_moderation_status(self):
         product_id = str(uuid4())
@@ -463,3 +474,128 @@ class ApproveProductApiTests(TestCase):
         response = client.post(f'/api/v1/products/{card.product_id}/approve', {}, format='json')
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.data['code'], 'APPROVE_WITHOUT_SKU')
+
+
+class SoftBlockApiTests(TestCase):
+    def _client_for(self, moderator_id):
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Bearer {build_test_token(moderator_id)}')
+        return client
+
+    def _in_review_card(self, product_id=None, moderator_id=None):
+        product_id = product_id or uuid4()
+        moderator_id = moderator_id or uuid4()
+        now = timezone.now()
+        card = ModerationCard.objects.create(
+            product_id=product_id,
+            event_type=ModerationCard.EventType.CREATED,
+            queue_status=ModerationCard.QueueStatus.IN_REVIEW,
+            assigned_to=str(moderator_id),
+            review_started_at=now,
+            snapshot_after={
+                'id': str(product_id),
+                'status': 'ON_MODERATION',
+                'skus': [{'id': str(uuid4()), 'deleted': False}],
+            },
+        )
+        ModerationCard.objects.filter(pk=card.pk).update(updated_at=now)
+        card.refresh_from_db()
+        return card, moderator_id
+
+    def _decline_payload(self, reason_code='BAD_MEDIA', **extra):
+        payload = {
+            'blocking_reason_id': reason_code,
+            'comment': 'Fix photos',
+            'field_reports': [
+                {'field_name': 'images', 'message': 'Blurry photos'},
+                {'field_name': 'description', 'message': 'Add size chart'},
+            ],
+        }
+        payload.update(extra)
+        return payload
+
+    @patch('moderation_api.soft_block.post_moderation_decision', return_value=((200, {}), None))
+    def test_soft_block_transitions_to_blocked_with_field_reports(self, mock_b2b):
+        card, moderator_id = self._in_review_card()
+        client = self._client_for(moderator_id)
+
+        response = client.post(
+            f'/api/v1/products/{card.product_id}/decline',
+            self._decline_payload(),
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['status'], 'BLOCKED')
+        self.assertFalse(response.data['hard_block'])
+        self.assertEqual(len(response.data['field_reports']), 2)
+
+        card.refresh_from_db()
+        self.assertEqual(card.queue_status, ModerationCard.QueueStatus.DECLINED)
+        self.assertEqual(card.decline_reason.code, 'BAD_MEDIA')
+
+        event = ModerationEvent.objects.get(product_id=card.product_id)
+        self.assertTrue(event.published)
+        self.assertEqual(event.payload['hard_block'], False)
+        mock_b2b.assert_called_once()
+
+    @patch('moderation_api.soft_block.post_moderation_decision', return_value=((200, {}), None))
+    def test_soft_block_emits_event_to_b2b(self, mock_b2b):
+        card, moderator_id = self._in_review_card()
+        client = self._client_for(moderator_id)
+
+        client.post(f'/api/v1/products/{card.product_id}/decline', self._decline_payload(), format='json')
+
+        payload = mock_b2b.call_args[0][0]
+        self.assertEqual(payload['status'], 'BLOCKED')
+        self.assertFalse(payload['hard_block'])
+        self.assertEqual(payload['idempotency_key'], f'soft-block:{card.id}')
+        self.assertEqual(payload['field_reports'][0]['field'], 'images')
+
+    def test_soft_block_unknown_reason_returns_400(self):
+        card, moderator_id = self._in_review_card()
+        client = self._client_for(moderator_id)
+
+        response = client.post(
+            f'/api/v1/products/{card.product_id}/decline',
+            self._decline_payload(reason_code='DOES_NOT_EXIST'),
+            format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'BLOCKING_REASON_NOT_FOUND')
+
+    def test_soft_block_others_card_returns_403(self):
+        owner = uuid4()
+        intruder = uuid4()
+        card, _ = self._in_review_card(moderator_id=owner)
+        client = self._client_for(intruder)
+
+        response = client.post(
+            f'/api/v1/products/{card.product_id}/decline',
+            self._decline_payload(),
+            format='json',
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data['code'], 'SOFT_BLOCK_NOT_ASSIGNED')
+
+    def test_soft_block_invalid_field_name_returns_400(self):
+        card, moderator_id = self._in_review_card()
+        client = self._client_for(moderator_id)
+        payload = self._decline_payload()
+        payload['field_reports'] = [{'field_name': 'unknown_field', 'message': 'Bad'}]
+
+        response = client.post(f'/api/v1/products/{card.product_id}/decline', payload, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'INVALID_FIELD_NAME')
+
+    def test_soft_block_hard_only_reason_returns_400(self):
+        card, moderator_id = self._in_review_card()
+        client = self._client_for(moderator_id)
+
+        response = client.post(
+            f'/api/v1/products/{card.product_id}/decline',
+            self._decline_payload(reason_code='FORBIDDEN_CONTENT'),
+            format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'HARD_REASON_REQUIRES_HARD_BLOCK')
+        self.assertTrue(BlockingReason.objects.get(code='FORBIDDEN_CONTENT').hard_only)

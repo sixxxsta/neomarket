@@ -7,6 +7,10 @@ class BlockingReason(models.Model):
     code = models.SlugField(primary_key=True, max_length=64)
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)
+    hard_only = models.BooleanField(
+        default=False,
+        help_text='Причина только для жёсткой блокировки (US-MOD-05), не для soft decline.',
+    )
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
