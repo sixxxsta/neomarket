@@ -762,15 +762,129 @@ class B2BApiTests(TestCase):
         self.assertEqual(response.data['total'], 1)
         self.assertEqual(response.data['items'][0]['id'], str(own_blocked.id))
 
-    def test_seller_list_search_is_case_insensitive_and_deleted_items_remain_visible(self):
+    def test_seller_list_search_is_case_insensitive_and_excludes_deleted_items(self):
         deleted_product = self.create_product(title='Neo CAMERA', status=Product.Status.MODERATED, deleted=True)
         self.create_product(title='Something else', status=Product.Status.MODERATED)
 
         response = self.client.get('/api/v1/products?limit=10&offset=0&search=camera', **self.headers)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data['total'], 1)
-        self.assertEqual(response.data['items'][0]['id'], str(deleted_product.id))
-        self.assertEqual(response.data['items'][0]['deleted'], True)
+        self.assertEqual(response.data['total'], 0)
+        self.assertEqual(response.data['items'], [])
+
+    def test_delete_sets_deleted_true(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        self.create_sku(product, active_quantity=3)
+
+        response = self.client.delete(f'/api/v1/products/{product.id}', **self.headers)
+        self.assertEqual(response.status_code, 204)
+
+        product.refresh_from_db()
+        self.assertTrue(product.deleted)
+
+    def test_delete_emits_event_to_moderation(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        self.create_sku(product, active_quantity=2)
+
+        response = self.client.delete(f'/api/v1/products/{product.id}', **self.headers)
+        self.assertEqual(response.status_code, 204)
+
+        moderation_event = IntegrationOutbox.objects.filter(
+            aggregate_id=product.id,
+            event_type='PRODUCT_UPDATED',
+        ).order_by('-created_at').first()
+        self.assertIsNotNone(moderation_event)
+        self.assertEqual(moderation_event.payload['event_type'], 'DELETED')
+        self.assertEqual(moderation_event.payload['snapshot_before']['deleted'], False)
+        self.assertEqual(moderation_event.payload['snapshot_after']['deleted'], True)
+
+    def test_delete_emits_product_deleted_to_b2c(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        sku_1 = self.create_sku(product, name='SKU-1')
+        sku_2 = self.create_sku(product, name='SKU-2')
+
+        response = self.client.delete(f'/api/v1/products/{product.id}', **self.headers)
+        self.assertEqual(response.status_code, 204)
+
+        b2c_event = IntegrationOutbox.objects.filter(
+            aggregate_id=product.id,
+            event_type='PRODUCT_DELETED',
+        ).order_by('-created_at').first()
+        self.assertIsNotNone(b2c_event)
+        self.assertEqual(b2c_event.payload['event_type'], 'DELETED')
+        self.assertCountEqual(
+            b2c_event.payload['sku_ids'],
+            [str(sku_1.id), str(sku_2.id)],
+        )
+
+    def test_delete_already_deleted_returns_400(self):
+        product = self.create_product(status=Product.Status.MODERATED, deleted=True)
+
+        response = self.client.delete(f'/api/v1/products/{product.id}', **self.headers)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'BAD_REQUEST')
+
+    def test_deleted_product_not_in_seller_list(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        self.create_sku(product, active_quantity=4)
+        self.assertEqual(self.client.delete(f'/api/v1/products/{product.id}', **self.headers).status_code, 204)
+
+        list_response = self.client.get('/api/v1/products?limit=10&offset=0', **self.headers)
+        self.assertEqual(list_response.status_code, 200)
+        returned_ids = {item['id'] for item in list_response.data['items']}
+        self.assertNotIn(str(product.id), returned_ids)
+
+    def test_delete_others_product_returns_403(self):
+        foreign_product = self.create_product(seller_id=self.other_seller_id, status=Product.Status.MODERATED)
+
+        response = self.client.delete(f'/api/v1/products/{foreign_product.id}', **self.headers)
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data['code'], 'FORBIDDEN')
+
+    def test_get_moderated_product_returns_full_payload(self):
+        product = self.create_product(status=Product.Status.MODERATED, title='Moderated phone')
+        sku = self.create_sku(product, price=1500, cost_price=1000, reserved_quantity=2, active_quantity=8)
+
+        response = self.client.get(f'/api/v1/products/{product.id}', **self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['id'], str(product.id))
+        self.assertEqual(response.data['status'], Product.Status.MODERATED)
+        self.assertEqual(response.data['title'], 'Moderated phone')
+        self.assertIsNone(response.data['blocking_reason'])
+        self.assertEqual(response.data['field_reports'], [])
+        self.assertEqual(len(response.data['skus']), 1)
+        self.assertEqual(response.data['skus'][0]['id'], str(sku.id))
+        self.assertEqual(response.data['skus'][0]['cost_price'], 1000)
+        self.assertEqual(response.data['skus'][0]['reserved_quantity'], 2)
+
+    def test_get_blocked_product_returns_blocking_reason_and_field_reports(self):
+        product = self.create_product(
+            status=Product.Status.BLOCKED,
+            blocking_reason={'title': 'Policy violation', 'id': str(uuid.uuid4())},
+            field_reports=[
+                {'field': 'title', 'message': 'Fix product title'},
+                {'field': 'description', 'message': 'Need details'},
+            ],
+        )
+        self.create_sku(product, active_quantity=1)
+
+        response = self.client.get(f'/api/v1/products/{product.id}', **self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['status'], Product.Status.BLOCKED)
+        self.assertEqual(response.data['blocking_reason']['title'], 'Policy violation')
+        self.assertEqual(len(response.data['field_reports']), 2)
+        self.assertEqual(response.data['field_reports'][0]['field'], 'title')
+
+    def test_get_others_product_returns_404(self):
+        foreign_product = self.create_product(seller_id=self.other_seller_id, status=Product.Status.MODERATED)
+
+        response = self.client.get(f'/api/v1/products/{foreign_product.id}', **self.headers)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data['code'], 'NOT_FOUND')
+
+    def test_get_nonexistent_returns_404(self):
+        response = self.client.get(f'/api/v1/products/{uuid.uuid4()}', **self.headers)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data['code'], 'NOT_FOUND')
 
     def test_delete_last_sku_on_moderation_returns_product_to_created(self):
         product = self.create_product(status=Product.Status.ON_MODERATION)
