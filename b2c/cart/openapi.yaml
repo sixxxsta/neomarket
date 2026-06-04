@@ -291,10 +291,12 @@ paths:
       tags:
         - Подписка
       summary: Подписка на уведомления о товаре
-      description: >
-        Создаёт подписку для текущего пользователя на уведомления
-        о появлении товара в наличии (IN_STOCK) или снижении цены (PRICE_DOWN).
-      operationId: subscribeToProduct
+      description: |
+        Создаёт подписку для пользователя из JWT на события `IN_STOCK` / `PRICE_DOWN`.
+        Отправка уведомлений — вне scope (MVP: только сохранение). Повторная подписка → **409**.
+      operationId: cart_subscribe_to_product
+      security:
+        - BearerAuth: []
       parameters:
         - name: product_id
           in: path
@@ -345,19 +347,6 @@ paths:
                           value: "Чёрный"
                         - name: "Объём памяти"
                           value: "256 ГБ"
-                notify_on: ["IN_STOCK", "PRICE_DOWN"]
-                created_at: "2026-03-09T12:00:00Z"
-        "200":
-          description: Подписка уже существует (идемпотентный ответ)
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/SubscriptionResponse"
-              example:
-                id: "6b9c1f4c-4b7c-4f8a-9a3b-6a8a2f95e2d1"
-                product:
-                  id: "123e4567-e89b-12d3-a456-426614174000"
-                  title: "iPhone 15 Pro Max"
                 notify_on: ["IN_STOCK", "PRICE_DOWN"]
                 created_at: "2026-03-09T12:00:00Z"
         "400":
@@ -420,6 +409,38 @@ paths:
               example:
                 code: "SERVICE_UNAVAILABLE"
                 message: "Сервис временно недоступен, попробуйте позже"
+
+    delete:
+      tags:
+        - Подписка
+      summary: Отписаться от уведомлений о товаре
+      description: |
+        Удаляет подписку текущего пользователя (JWT). Идемпотентно: если подписки не было — **204**.
+      operationId: cart_unsubscribe_from_product
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Подписка удалена (или отсутствовала)
+        "400":
+          description: Невалидный product_id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Требуется авторизация
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
 # ========== КОРЗИНА ==========
   /api/v1/cart:
