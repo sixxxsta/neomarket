@@ -107,6 +107,15 @@ def _get_user_id_for_favorites(request):
     return user_id, None
 
 
+def _serialize_subscription_response(subscription, product):
+    return {
+        "id": str(subscription.id),
+        "product": product,
+        "notify_on": subscription.notify_on,
+        "created_at": subscription.created_at,
+    }
+
+
 def _favorite_mutation_payload(favorite, message):
     return {
         "product_id": str(favorite.product_id),
@@ -717,20 +726,7 @@ class FavoriteSubscribeView(APIView):
         if not product_uuid:
             return _error("Некорректный UUID product_id", "INVALID_PARAMETER", status.HTTP_400_BAD_REQUEST)
 
-        body = request.data or {}
-        events = body.get("events")
-        if events is None and body.get("notify_on") is not None:
-            legacy_map = {
-                "IN_STOCK": Subscription.NotifyEvent.IN_STOCK,
-                "BACK_IN_STOCK": Subscription.NotifyEvent.IN_STOCK,
-                "PRICE_DOWN": Subscription.NotifyEvent.PRICE_DOWN,
-                "PRICE_DROP": Subscription.NotifyEvent.PRICE_DOWN,
-            }
-            events = [legacy_map.get(item, item) for item in body.get("notify_on", [])]
-        if not events:
-            events = [Subscription.NotifyEvent.IN_STOCK, Subscription.NotifyEvent.PRICE_DOWN]
-
-        serializer = SubscribeRequestSerializer(data={"notify_on": events})
+        serializer = SubscribeRequestSerializer(data=request.data or {})
         if not serializer.is_valid():
             return _error("Должен быть указан хотя бы один тип уведомления", "INVALID_NOTIFY_ON", status.HTTP_400_BAD_REQUEST)
 
@@ -740,12 +736,22 @@ class FavoriteSubscribeView(APIView):
         if not products:
             return _error("Товар не найден", "PRODUCT_NOT_FOUND", status.HTTP_404_NOT_FOUND)
 
-        Subscription.objects.update_or_create(
+        if Subscription.objects.filter(user_id=user_id, product_id=product_uuid).exists():
+            return _error(
+                "Вы уже подписаны на уведомления об этом товаре",
+                "SUBSCRIPTION_ALREADY_EXISTS",
+                status.HTTP_409_CONFLICT,
+            )
+
+        subscription = Subscription.objects.create(
             user_id=user_id,
             product_id=product_uuid,
-            defaults={"notify_on": serializer.validated_data["notify_on"]},
+            notify_on=serializer.validated_data["notify_on"],
         )
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        return Response(
+            _serialize_subscription_response(subscription, products[0]),
+            status=status.HTTP_201_CREATED,
+        )
 
     def delete(self, request, product_id):
         user_id, error = _get_user_id_for_favorites(request)

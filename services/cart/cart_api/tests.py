@@ -167,24 +167,66 @@ class CartApiTests(TestCase):
         self.assertEqual(returned_ids, {str(self.product_id)})
         self.assertNotIn(str(other_product_id), returned_ids)
 
-    @patch("cart_api.views.requests.get")
-    def test_subscribe_and_unsubscribe_product(self, mock_get):
-        mock_get.return_value = self._mock_response({"items": [self._catalog_product()]})
-        subscribe = self.client.post(
-            f"/api/v1/favorites/{self.product_id}/subscribe",
-            {"notify_on": ["IN_STOCK"]},
-            format="json",
-            HTTP_AUTHORIZATION=self.auth,
-        )
-        self.assertEqual(subscribe.status_code, 204)
-        self.assertTrue(Subscription.objects.filter(user_id=self.user_id, product_id=self.product_id).exists())
+    def _post_subscribe(self, product_id, payload, query=""):
+        path = f"/api/v1/favorites/{product_id}/subscribe"
+        if query:
+            path = f"{path}?{query}"
+        return self.client.post(path, payload, format="json", HTTP_AUTHORIZATION=self.auth)
 
-        unsubscribe = self.client.delete(
+    @patch("cart_api.views.requests.get")
+    def test_subscribe_returns_201_with_notify_on(self, mock_get):
+        mock_get.return_value = self._mock_response({"items": [self._catalog_product()]})
+        response = self._post_subscribe(self.product_id, {"notify_on": ["IN_STOCK", "PRICE_DOWN"]})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["notify_on"], ["IN_STOCK", "PRICE_DOWN"])
+        self.assertEqual(response.data["product"]["id"], str(self.product_id))
+        subscription = Subscription.objects.get(user_id=self.user_id, product_id=self.product_id)
+        self.assertEqual(subscription.notify_on, ["IN_STOCK", "PRICE_DOWN"])
+
+    @patch("cart_api.views.requests.get")
+    def test_duplicate_subscription_returns_409(self, mock_get):
+        mock_get.return_value = self._mock_response({"items": [self._catalog_product()]})
+        payload = {"notify_on": ["IN_STOCK"]}
+        self.assertEqual(self._post_subscribe(self.product_id, payload).status_code, 201)
+
+        duplicate = self._post_subscribe(self.product_id, payload)
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(duplicate.data["code"], "SUBSCRIPTION_ALREADY_EXISTS")
+        self.assertEqual(Subscription.objects.filter(user_id=self.user_id, product_id=self.product_id).count(), 1)
+
+    def test_invalid_notify_on_returns_400(self):
+        response = self._post_subscribe(self.product_id, {"notify_on": []})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["code"], "INVALID_NOTIFY_ON")
+
+        bad_event = self._post_subscribe(self.product_id, {"notify_on": ["UNKNOWN_EVENT"]})
+        self.assertEqual(bad_event.status_code, 400)
+
+    @patch("cart_api.views.requests.get")
+    def test_subscribe_to_unknown_product_returns_404(self, mock_get):
+        unknown_id = uuid.uuid4()
+        mock_get.return_value = self._mock_response({"items": []})
+        response = self._post_subscribe(unknown_id, {"notify_on": ["IN_STOCK"]})
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data["code"], "PRODUCT_NOT_FOUND")
+
+    @patch("cart_api.views.requests.get")
+    def test_unsubscribe_is_idempotent(self, mock_get):
+        mock_get.return_value = self._mock_response({"items": [self._catalog_product()]})
+        self._post_subscribe(self.product_id, {"notify_on": ["IN_STOCK"]})
+
+        first = self.client.delete(
             f"/api/v1/favorites/{self.product_id}/subscribe",
             HTTP_AUTHORIZATION=self.auth,
         )
-        self.assertEqual(unsubscribe.status_code, 204)
+        self.assertEqual(first.status_code, 204)
         self.assertFalse(Subscription.objects.filter(user_id=self.user_id, product_id=self.product_id).exists())
+
+        second = self.client.delete(
+            f"/api/v1/favorites/{self.product_id}/subscribe",
+            HTTP_AUTHORIZATION=self.auth,
+        )
+        self.assertEqual(second.status_code, 204)
 
     def test_banner_events_accept_batch(self):
         banner_a = Banner.objects.create(title="A", image_url="/a.jpg", link="/a", priority=1)
