@@ -319,7 +319,7 @@ class DashboardOverviewView(APIView):
             'created_products': products.filter(status=Product.Status.CREATED, deleted=False).count(),
             'on_moderation_products': products.filter(status=Product.Status.ON_MODERATION, deleted=False).count(),
             'blocked_products': products.filter(status__in=[Product.Status.BLOCKED, Product.Status.HARD_BLOCKED], deleted=False).count(),
-            'pending_invoices': invoices.filter(status=Invoice.Status.CREATED).count(),
+            'pending_invoices': invoices.filter(status__in=[Invoice.Status.PENDING, Invoice.Status.CREATED]).count(),
             'accepted_invoices': invoices.filter(status=Invoice.Status.ACCEPTED).count(),
         }
         return Response(overview)
@@ -803,6 +803,26 @@ class SkuMutationView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+def _validate_invoice_items(seller_id, items):
+    sku_ids = [row['sku_id'] for row in items]
+    skus = {
+        sku.id: sku
+        for sku in Sku.objects.select_related('product').filter(id__in=sku_ids, deleted=False)
+    }
+
+    rows = []
+    for item in items:
+        sku = skus.get(item['sku_id'])
+        if not sku:
+            return None, _error('BAD_REQUEST', 'Invoice contains unknown sku', status.HTTP_400_BAD_REQUEST)
+        if sku.product.seller_id != seller_id:
+            return None, _error('FORBIDDEN', 'Invoice contains foreign sku', status.HTTP_403_FORBIDDEN)
+        if sku.product.deleted or sku.product.status != Product.Status.MODERATED:
+            return None, _error('BAD_REQUEST', 'Invoice accepts only MODERATED seller skus', status.HTTP_400_BAD_REQUEST)
+        rows.append((sku, item['quantity']))
+    return rows, None
+
+
 @extend_schema_view(
     get=extend_schema(operation_id='b2b_list_invoices', responses=OpenApiTypes.OBJECT),
     post=extend_schema(operation_id='b2b_create_invoice', request=CreateInvoiceRequestSerializer, responses=InvoiceSerializer),
@@ -830,27 +850,14 @@ class InvoicesView(APIView):
         if serializer.validated_data.get('seller_id') and serializer.validated_data['seller_id'] != seller_id:
             return _error('FORBIDDEN', 'seller_id in payload must match authenticated seller', status.HTTP_403_FORBIDDEN)
 
-        sku_ids = [row['sku_id'] for row in serializer.validated_data['items']]
-        skus = {
-            sku.id: sku
-            for sku in Sku.objects.select_related('product').filter(id__in=sku_ids, deleted=False)
-        }
-
-        rows = []
-        for item in serializer.validated_data['items']:
-            sku = skus.get(item['sku_id'])
-            if not sku:
-                return _error('BAD_REQUEST', 'Invoice contains unknown sku', status.HTTP_400_BAD_REQUEST)
-            if sku.product.seller_id != seller_id:
-                return _error('FORBIDDEN', 'Invoice contains foreign sku', status.HTTP_403_FORBIDDEN)
-            if sku.product.deleted or sku.product.status != Product.Status.MODERATED:
-                return _error('BAD_REQUEST', 'Invoice accepts only MODERATED seller skus', status.HTTP_400_BAD_REQUEST)
-            rows.append((sku, item['quantity']))
+        rows, error = _validate_invoice_items(seller_id, serializer.validated_data['items'])
+        if error:
+            return error
 
         invoice = Invoice.objects.create(
             seller_id=seller_id,
             warehouse_id=serializer.validated_data['warehouse_id'],
-            status=Invoice.Status.CREATED,
+            status=Invoice.Status.PENDING,
         )
         InvoiceItem.objects.bulk_create([InvoiceItem(invoice=invoice, sku=sku, quantity=quantity) for sku, quantity in rows])
         invoice.refresh_from_db()
@@ -890,8 +897,8 @@ class InvoiceAcceptView(APIView):
         if not invoice:
             return _error('NOT_FOUND', 'Invoice not found', status.HTTP_404_NOT_FOUND)
 
-        if invoice.status != Invoice.Status.CREATED:
-            return _error('BAD_REQUEST', 'Only CREATED invoice can be accepted', status.HTTP_400_BAD_REQUEST)
+        if invoice.status not in {Invoice.Status.PENDING, Invoice.Status.CREATED}:
+            return _error('BAD_REQUEST', 'Only pending invoice can be accepted', status.HTTP_400_BAD_REQUEST)
 
         items = list(invoice.items.select_related('sku'))
         for item in items:
