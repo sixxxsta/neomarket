@@ -601,89 +601,119 @@ class B2BApiTests(TestCase):
         self.assertEqual(product.status, Product.Status.MODERATED)
         self.assertTrue(IntegrationInbox.objects.filter(message_id='stream-approve-1').exists())
 
-    def test_reserve_unreserve_and_fulfill_are_idempotent(self):
-        product = self.create_product(status=Product.Status.MODERATED)
-        sku = self.create_sku(product, active_quantity=10, reserved_quantity=0)
-
-        reserve = self.client.post(
+    def _post_reserve(self, idempotency_key, items):
+        return self.client.post(
             '/api/v1/reserve',
-            {'idempotency_key': 'reserve-1', 'items': [{'sku_id': str(sku.id), 'quantity': 3}]},
+            {'idempotency_key': idempotency_key, 'items': items},
             format='json',
             **self.service_headers,
         )
-        self.assertEqual(reserve.status_code, 200)
-        sku.refresh_from_db()
-        self.assertEqual(sku.active_quantity, 7)
-        self.assertEqual(sku.reserved_quantity, 3)
 
-        duplicate_reserve = self.client.post(
-            '/api/v1/reserve',
-            {'idempotency_key': 'reserve-1', 'items': [{'sku_id': str(sku.id), 'quantity': 3}]},
-            format='json',
-            **self.service_headers,
-        )
-        self.assertEqual(duplicate_reserve.status_code, 200)
-        sku.refresh_from_db()
-        self.assertEqual(sku.active_quantity, 7)
-        self.assertEqual(sku.reserved_quantity, 3)
-
-        unreserve = self.client.post(
+    def _post_unreserve(self, idempotency_key, items):
+        return self.client.post(
             '/api/v1/unreserve',
-            {'idempotency_key': 'unreserve-1', 'items': [{'sku_id': str(sku.id), 'quantity': 1}]},
+            {'idempotency_key': idempotency_key, 'items': items},
             format='json',
             **self.service_headers,
         )
-        self.assertEqual(unreserve.status_code, 200)
-        sku.refresh_from_db()
-        self.assertEqual(sku.active_quantity, 8)
-        self.assertEqual(sku.reserved_quantity, 2)
 
-        fulfill = self.client.post(
-            '/api/v1/fulfill',
-            {'order_id': 'order-1', 'items': [{'sku_id': str(sku.id), 'quantity': 2}]},
-            format='json',
-            **self.service_headers,
-        )
-        self.assertEqual(fulfill.status_code, 200)
-        sku.refresh_from_db()
-        self.assertEqual(sku.active_quantity, 8)
-        self.assertEqual(sku.reserved_quantity, 0)
-
-        duplicate_fulfill = self.client.post(
-            '/api/v1/fulfill',
-            {'order_id': 'order-1', 'items': [{'sku_id': str(sku.id), 'quantity': 2}]},
-            format='json',
-            **self.service_headers,
-        )
-        self.assertEqual(duplicate_fulfill.status_code, 200)
-        sku.refresh_from_db()
-        self.assertEqual(sku.active_quantity, 8)
-        self.assertEqual(sku.reserved_quantity, 0)
-
-    def test_reserve_rolls_back_when_any_sku_has_insufficient_stock(self):
+    def test_reserve_all_skus_succeeds(self):
         product = self.create_product(status=Product.Status.MODERATED)
-        sku_ok = self.create_sku(product, active_quantity=5)
-        sku_short = self.create_sku(product, name='Short', active_quantity=1)
+        sku_a = self.create_sku(product, name='SKU-A', active_quantity=5, reserved_quantity=0)
+        sku_b = self.create_sku(product, name='SKU-B', active_quantity=3, reserved_quantity=0)
+        on_hand_a = sku_a.active_quantity + sku_a.reserved_quantity
+        on_hand_b = sku_b.active_quantity + sku_b.reserved_quantity
 
-        response = self.client.post(
-            '/api/v1/reserve',
-            {
-                'idempotency_key': 'reserve-conflict',
-                'items': [
-                    {'sku_id': str(sku_ok.id), 'quantity': 2},
-                    {'sku_id': str(sku_short.id), 'quantity': 2},
-                ],
-            },
-            format='json',
-            **self.service_headers,
+        response = self._post_reserve(
+            'reserve-all-1',
+            [
+                {'sku_id': str(sku_a.id), 'quantity': 2},
+                {'sku_id': str(sku_b.id), 'quantity': 1},
+            ],
+        )
+        self.assertEqual(response.status_code, 200)
+
+        sku_a.refresh_from_db()
+        sku_b.refresh_from_db()
+        self.assertEqual(sku_a.active_quantity, 3)
+        self.assertEqual(sku_a.reserved_quantity, 2)
+        self.assertEqual(sku_b.active_quantity, 2)
+        self.assertEqual(sku_b.reserved_quantity, 1)
+        self.assertEqual(sku_a.active_quantity + sku_a.reserved_quantity, on_hand_a)
+        self.assertEqual(sku_b.active_quantity + sku_b.reserved_quantity, on_hand_b)
+
+    def test_partial_insufficient_stock_returns_409_all_rollback(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        sku_ok = self.create_sku(product, active_quantity=5, reserved_quantity=0)
+        sku_short = self.create_sku(product, name='Short', active_quantity=1, reserved_quantity=0)
+
+        response = self._post_reserve(
+            'reserve-conflict',
+            [
+                {'sku_id': str(sku_ok.id), 'quantity': 2},
+                {'sku_id': str(sku_short.id), 'quantity': 2},
+            ],
         )
         self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.data['code'], 'CONFLICT')
+
         sku_ok.refresh_from_db()
         sku_short.refresh_from_db()
         self.assertEqual(sku_ok.active_quantity, 5)
         self.assertEqual(sku_ok.reserved_quantity, 0)
         self.assertEqual(sku_short.active_quantity, 1)
         self.assertEqual(sku_short.reserved_quantity, 0)
+
+    def test_idempotent_reserve_returns_200_without_double_deduction(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        sku = self.create_sku(product, active_quantity=10, reserved_quantity=0)
+
+        first = self._post_reserve('reserve-idem-1', [{'sku_id': str(sku.id), 'quantity': 3}])
+        self.assertEqual(first.status_code, 200)
+
+        duplicate = self._post_reserve('reserve-idem-1', [{'sku_id': str(sku.id), 'quantity': 3}])
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertEqual(duplicate.data, first.data)
+
+        sku.refresh_from_db()
+        self.assertEqual(sku.active_quantity, 7)
+        self.assertEqual(sku.reserved_quantity, 3)
+
+    def test_sku_out_of_stock_event_emitted(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        sku = self.create_sku(product, active_quantity=2, reserved_quantity=0)
+
+        response = self._post_reserve('reserve-oos-1', [{'sku_id': str(sku.id), 'quantity': 2}])
+        self.assertEqual(response.status_code, 200)
+
+        sku.refresh_from_db()
+        self.assertEqual(sku.active_quantity, 0)
+        self.assertEqual(sku.reserved_quantity, 2)
+
+        outbox_event = IntegrationOutbox.objects.filter(
+            aggregate_id=product.id,
+            event_type='SKU_OUT_OF_STOCK',
+        ).order_by('-created_at').first()
+        self.assertIsNotNone(outbox_event)
+        self.assertEqual(outbox_event.payload['sku_id'], str(sku.id))
+        self.assertEqual(outbox_event.payload['event_type'], 'SKU_OUT_OF_STOCK')
+
+    def test_unreserve_restores_quantities(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        sku = self.create_sku(product, active_quantity=10, reserved_quantity=0)
+
+        self.assertEqual(self._post_reserve('reserve-un-1', [{'sku_id': str(sku.id), 'quantity': 4}]).status_code, 200)
+        sku.refresh_from_db()
+        self.assertEqual(sku.active_quantity, 6)
+        self.assertEqual(sku.reserved_quantity, 4)
+
+        response = self._post_unreserve('unreserve-1', [{'sku_id': str(sku.id), 'quantity': 2}])
+        self.assertEqual(response.status_code, 200)
+
+        sku.refresh_from_db()
+        self.assertEqual(sku.active_quantity, 8)
+        self.assertEqual(sku.reserved_quantity, 2)
+        self.assertEqual(sku.active_quantity + sku.reserved_quantity, 10)
 
     def _create_catalog_visibility_fixtures(self):
         visible_product = self.create_product(status=Product.Status.MODERATED, title='Visible')

@@ -920,6 +920,28 @@ class InvoiceAcceptView(APIView):
         return Response(InvoiceSerializer(invoice).data)
 
 
+def _lock_skus_for_inventory(sku_ids):
+    return {
+        sku.id: sku
+        for sku in Sku.objects.select_for_update()
+        .select_related('product')
+        .filter(id__in=sku_ids, deleted=False)
+        .order_by('id')
+    }
+
+
+def _validate_reserve_items(sku_map, requested_items, sku_ids):
+    if len(sku_map) != len(set(sku_ids)):
+        return _error('BAD_REQUEST', 'One or more SKU ids are invalid', status.HTTP_400_BAD_REQUEST)
+    for item in requested_items:
+        sku = sku_map[item['sku_id']]
+        if sku.product.deleted or sku.product.status != Product.Status.MODERATED:
+            return _error('BAD_REQUEST', 'Only MODERATED SKUs can be reserved', status.HTTP_400_BAD_REQUEST)
+        if int(sku.active_quantity or 0) < item['quantity']:
+            return _error('CONFLICT', 'Insufficient stock for reserve', status.HTTP_409_CONFLICT)
+    return None
+
+
 class ReserveView(APIView):
     @transaction.atomic
     def post(self, request):
@@ -940,21 +962,12 @@ class ReserveView(APIView):
 
         requested_items = serializer.validated_data['items']
         sku_ids = [row['sku_id'] for row in requested_items]
-        sku_map = {
-            sku.id: sku
-            for sku in Sku.objects.select_for_update().select_related('product').filter(id__in=sku_ids, deleted=False).order_by('id')
-        }
-        if len(sku_map) != len(set(sku_ids)):
-            return _error('BAD_REQUEST', 'One or more SKU ids are invalid', status.HTTP_400_BAD_REQUEST)
+        sku_map = _lock_skus_for_inventory(sku_ids)
+        validation_error = _validate_reserve_items(sku_map, requested_items, sku_ids)
+        if validation_error:
+            return validation_error
 
         response_items = []
-        for item in requested_items:
-            sku = sku_map[item['sku_id']]
-            if sku.product.deleted or sku.product.status != Product.Status.MODERATED:
-                return _error('BAD_REQUEST', 'Only MODERATED SKUs can be reserved', status.HTTP_400_BAD_REQUEST)
-            if int(sku.active_quantity or 0) < item['quantity']:
-                return _error('CONFLICT', 'Insufficient stock for reserve', status.HTTP_409_CONFLICT)
-
         for item in requested_items:
             sku = sku_map[item['sku_id']]
             sku.active_quantity -= item['quantity']
@@ -995,10 +1008,7 @@ class UnreserveView(APIView):
 
         requested_items = serializer.validated_data['items']
         sku_ids = [row['sku_id'] for row in requested_items]
-        sku_map = {
-            sku.id: sku
-            for sku in Sku.objects.select_for_update().select_related('product').filter(id__in=sku_ids, deleted=False).order_by('id')
-        }
+        sku_map = _lock_skus_for_inventory(sku_ids)
         if len(sku_map) != len(set(sku_ids)):
             return _error('BAD_REQUEST', 'One or more SKU ids are invalid', status.HTTP_400_BAD_REQUEST)
 
