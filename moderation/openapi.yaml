@@ -157,7 +157,12 @@ paths:
 
   /api/v1/products/{id}/decline:
     post:
-      summary: Заблокировать товар с причиной
+      summary: Мягкая блокировка (IN_REVIEW → BLOCKED)
+      description: |
+        Мягкая блокировка с замечаниями по полям. Синхронно отправляет в B2B
+        `status=BLOCKED`, `hard_block=false` и `field_reports`.
+        Идемпотентность: `idempotency_key` = `soft-block:{card_id}`.
+        Причины с `hard_only=true` отклоняются — нужен hard-block (US-MOD-05).
       tags: [Decisions]
       parameters:
         - name: id
@@ -174,22 +179,48 @@ paths:
               $ref: "#/components/schemas/DeclineRequest"
       responses:
         "200":
-          description: Товар заблокирован, статус -> BLOCKED
+          description: Товар мягко заблокирован
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  product_id:
-                    type: string
-                    format: uuid
-                  status:
-                    type: string
-                    example: BLOCKED
-                  reason:
-                    $ref: "#/components/schemas/DeclineReason"
+                $ref: "#/components/schemas/SoftBlockResponse"
+        "400":
+          description: Невалидная причина, поле или hard_only причина
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                unknown_reason:
+                  value:
+                    code: BLOCKING_REASON_NOT_FOUND
+                    message: Blocking reason does not exist
+                invalid_field:
+                  value:
+                    code: INVALID_FIELD_NAME
+                    message: Unknown field name
+                hard_only:
+                  value:
+                    code: HARD_REASON_REQUIRES_HARD_BLOCK
+                    message: This blocking reason requires hard block endpoint
+        "403":
+          description: Карточка закреплена за другим модератором
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
-          description: Товар не найден в очереди
+          description: Нет карточки IN_REVIEW
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: B2B недоступен
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/v1/product-blocking-reasons:
     get:
@@ -273,16 +304,85 @@ components:
 
     DeclineRequest:
       type: object
-      required: [reason_code]
+      required: [blocking_reason_id]
       properties:
+        blocking_reason_id:
+          type: string
+          description: Код причины из справочника (US-MOD-06)
         reason_code:
           type: string
+          deprecated: true
+          description: Alias для blocking_reason_id
         comment:
           type: string
-        fields:
+          maxLength: 500
+        field_reports:
           type: array
           items:
+            $ref: "#/components/schemas/FieldReportItem"
+        fields:
+          type: array
+          deprecated: true
+          items:
             type: string
+
+    FieldReportItem:
+      type: object
+      required: [field_name]
+      properties:
+        field_name:
+          type: string
+          enum: [title, description, images, price, category, skus, characteristics, brand]
+        message:
+          type: string
+          maxLength: 500
+
+    SoftBlockResponse:
+      type: object
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          example: BLOCKED
+        hard_block:
+          type: boolean
+          example: false
+        field_reports:
+          type: array
+          items:
+            $ref: "#/components/schemas/FieldReportItem"
+        reason:
+          $ref: "#/components/schemas/DeclineReason"
+
+    ModerationBlockedEvent:
+      type: object
+      required: [idempotency_key, product_id, status, hard_block]
+      properties:
+        idempotency_key:
+          type: string
+          example: "soft-block:6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+        product_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [BLOCKED]
+        hard_block:
+          type: boolean
+          example: false
+        blocking_reason:
+          type: object
+        field_reports:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              message:
+                type: string
 
     DeclineReason:
       type: object

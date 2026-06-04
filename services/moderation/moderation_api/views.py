@@ -3,6 +3,7 @@ from uuid import uuid4
 
 from django.db import transaction
 from .approve import ApproveError, approve_product
+from .soft_block import SoftBlockError, soft_block_product
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from jwt import InvalidTokenError
@@ -159,79 +160,35 @@ class ProductApproveView(APIView):
 class ProductDeclineView(APIView):
     serializer_class = DeclineRequestSerializer
 
-    @transaction.atomic
     def post(self, request, id):
         auth_context, error = _authorize_moderator(request)
         if error:
             return error
 
-        moderator = auth_context.actor
-
         serializer = DeclineRequestSerializer(data=request.data)
         if not serializer.is_valid():
             return _error('Invalid decline payload', 'BAD_REQUEST', status.HTTP_400_BAD_REQUEST)
 
-        reason = BlockingReason.objects.filter(code=serializer.validated_data['reason_code'], is_active=True).first()
-        if not reason:
-            return _error('Blocking reason does not exist', 'REASON_NOT_FOUND', status.HTTP_400_BAD_REQUEST)
+        legacy_fields = serializer.validated_data.get('fields') or []
+        field_reports = serializer.validated_data.get('field_reports') or []
+        if not field_reports and legacy_fields:
+            field_reports = [
+                {'field_name': field_name, 'message': serializer.validated_data.get('comment', '')}
+                for field_name in legacy_fields
+            ]
 
-        open_cards = _open_cards_queryset(id)
-        if not open_cards.exists():
-            return _error('Product is not found in moderation queue', 'NOT_FOUND', status.HTTP_404_NOT_FOUND)
+        try:
+            result = soft_block_product(
+                id,
+                auth_context.actor,
+                serializer.validated_data['blocking_reason_id'],
+                comment=serializer.validated_data.get('comment', ''),
+                field_reports=field_reports,
+            )
+        except SoftBlockError as exc:
+            return _error(exc.message, exc.code, exc.http_status)
 
-        decline_comment = serializer.validated_data.get('comment', '')
-        decline_fields = serializer.validated_data.get('fields', [])
-        decided_at = datetime.now(timezone.utc)
-        open_cards.update(
-            queue_status=ModerationCard.QueueStatus.DECLINED,
-            decline_reason=reason,
-            decline_comment=decline_comment,
-            decline_fields=decline_fields,
-            decided_by=moderator,
-            decided_at=decided_at,
-            updated_at=decided_at,
-        )
-
-        blocking_reason = {
-            'code': reason.code,
-            'title': reason.title,
-            'comment': decline_comment,
-        }
-        field_reports = _build_field_reports(decline_fields, decline_comment or reason.title)
-        idempotency_key = str(uuid4())
-        ModerationEvent.objects.create(
-            event_type=ModerationEvent.EventType.PRODUCT_DECLINED,
-            product_id=id,
-            payload={
-                'idempotency_key': idempotency_key,
-                'product_id': str(id),
-                'moderated_at': decided_at.isoformat(),
-                'moderator': moderator,
-                'result': 'BLOCKED',
-                'status': 'BLOCKED',
-                'blocking_reason': blocking_reason,
-                'field_reports': field_reports,
-                'reason': {
-                    'code': reason.code,
-                    'title': reason.title,
-                    'comment': decline_comment,
-                    'fields': decline_fields,
-                },
-            },
-        )
-
-        return Response(
-            {
-                'product_id': id,
-                'status': 'BLOCKED',
-                'reason': {
-                    'code': reason.code,
-                    'title': reason.title,
-                    'comment': decline_comment,
-                    'fields': decline_fields,
-                },
-            }
-        )
+        return Response(result)
 
 
 @extend_schema_view(
