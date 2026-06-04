@@ -65,6 +65,9 @@ class CategorySerializer(serializers.ModelSerializer):
 class SkuSerializer(serializers.ModelSerializer):
     product_id = serializers.UUIDField(source='product.id', read_only=True)
     product_title = serializers.CharField(source='product.title', read_only=True)
+    discount = serializers.SerializerMethodField()
+    stock_quantity = serializers.SerializerMethodField()
+    article = serializers.SerializerMethodField()
 
     class Meta:
         model = Sku
@@ -74,13 +77,30 @@ class SkuSerializer(serializers.ModelSerializer):
             'product_title',
             'name',
             'price',
+            'discount',
             'cost_price',
+            'stock_quantity',
             'active_quantity',
             'reserved_quantity',
+            'article',
             'images',
             'characteristics',
             'deleted',
+            'created_at',
+            'updated_at',
         ]
+
+    def get_discount(self, obj):
+        return 0
+
+    def get_stock_quantity(self, obj):
+        return int(obj.active_quantity or 0) + int(obj.reserved_quantity or 0)
+
+    def get_article(self, obj):
+        for item in obj.characteristics or []:
+            if isinstance(item, dict) and str(item.get('name', '')).lower() in {'article', 'sku', 'артикул'}:
+                return item.get('value')
+        return None
 
 
 class CatalogSkuSerializer(serializers.ModelSerializer):
