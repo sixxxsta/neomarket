@@ -355,7 +355,126 @@ class B2BApiTests(TestCase):
         self.assertEqual(response.data['stock_quantity'], 4)
         self.assertEqual(response.data['article'], 'ART-001')
 
-    def test_soft_delete_marks_product_and_keeps_deleted_in_seller_list(self):
+    def _put_product(self, product_id, **extra):
+        payload = {'title': 'Updated title'}
+        payload.update(extra)
+        return self.client.put(f'/api/v1/products/{product_id}', payload, format='json', **self.headers)
+
+    def _put_sku(self, sku_id, **extra):
+        payload = {'name': 'Updated SKU'}
+        payload.update(extra)
+        return self.client.put(f'/api/v1/skus/{sku_id}', payload, format='json', **self.headers)
+
+    def _latest_moderation_event(self, product_id):
+        return (
+            IntegrationOutbox.objects.filter(aggregate_id=product_id, event_type='PRODUCT_UPDATED')
+            .order_by('-created_at')
+            .first()
+        )
+
+    def test_edit_moderated_product_returns_to_on_moderation(self):
+        product = self.create_product(status=Product.Status.MODERATED, title='Before edit')
+        self.create_sku(product)
+
+        response = self._put_product(product.id, title='After edit')
+        self.assertEqual(response.status_code, 200)
+
+        product.refresh_from_db()
+        self.assertEqual(product.status, Product.Status.ON_MODERATION)
+        self.assertEqual(product.title, 'After edit')
+
+        event = self._latest_moderation_event(product.id)
+        self.assertIsNotNone(event)
+        self.assertEqual(event.payload['event_type'], 'EDITED')
+        self.assertEqual(event.payload['snapshot_before']['status'], Product.Status.MODERATED)
+        self.assertEqual(event.payload['snapshot_after']['status'], Product.Status.ON_MODERATION)
+
+    def test_edit_blocked_product_returns_to_on_moderation(self):
+        product = self.create_product(status=Product.Status.BLOCKED, title='Blocked item')
+        sku = self.create_sku(product)
+        product.blocking_reason = {'title': 'Needs fix'}
+        product.field_reports = [{'field': 'images', 'message': 'Bad photo'}]
+        product.save(update_fields=['blocking_reason', 'field_reports'])
+
+        response = self._put_product(product.id, description='Fixed description')
+        self.assertEqual(response.status_code, 200)
+
+        product.refresh_from_db()
+        self.assertEqual(product.status, Product.Status.ON_MODERATION)
+        self.assertIsNone(product.blocking_reason)
+        self.assertEqual(product.field_reports, [])
+
+        event = self._latest_moderation_event(product.id)
+        self.assertEqual(event.payload['event_type'], 'EDITED')
+
+        sku_response = self._put_sku(sku.id, price=1500)
+        self.assertEqual(sku_response.status_code, 200)
+        product.refresh_from_db()
+        self.assertEqual(product.status, Product.Status.ON_MODERATION)
+
+    def test_reserves_preserved_after_sku_edit(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        sku = self.create_sku(product, active_quantity=10, reserved_quantity=5)
+
+        response = self._put_sku(sku.id, name='Renamed SKU', price=2000, active_quantity=10)
+        self.assertEqual(response.status_code, 200)
+
+        sku.refresh_from_db()
+        self.assertEqual(sku.name, 'Renamed SKU')
+        self.assertEqual(sku.price, 2000)
+        self.assertEqual(sku.reserved_quantity, 5)
+        self.assertEqual(sku.active_quantity, 10)
+
+        product.refresh_from_db()
+        self.assertEqual(product.status, Product.Status.ON_MODERATION)
+
+    def test_edit_hard_blocked_returns_403(self):
+        product = self.create_product(status=Product.Status.HARD_BLOCKED, title='Hard blocked')
+        sku = self.create_sku(product)
+
+        product_edit = self._put_product(product.id, title='Attempt')
+        self.assertEqual(product_edit.status_code, 403)
+        self.assertEqual(product_edit.data['code'], 'FORBIDDEN')
+
+        sku_edit = self._put_sku(sku.id, name='Attempt SKU')
+        self.assertEqual(sku_edit.status_code, 403)
+        self.assertEqual(sku_edit.data['code'], 'FORBIDDEN')
+
+        product.refresh_from_db()
+        sku.refresh_from_db()
+        self.assertEqual(product.status, Product.Status.HARD_BLOCKED)
+        self.assertEqual(product.title, 'Hard blocked')
+        self.assertEqual(sku.name, 'SKU')
+
+    def test_edit_others_product_returns_403(self):
+        own_product = self.create_product(title='Mine')
+        foreign_product = self.create_product(
+            seller_id=self.other_seller_id,
+            title='Foreign',
+            status=Product.Status.MODERATED,
+        )
+        foreign_sku = self.create_sku(foreign_product)
+
+        own_edit = self._put_product(own_product.id, title='Still mine')
+        self.assertEqual(own_edit.status_code, 200)
+
+        foreign_product_edit = self._put_product(foreign_product.id, title='Stolen')
+        self.assertEqual(foreign_product_edit.status_code, 403)
+        self.assertEqual(foreign_product_edit.data['code'], 'FORBIDDEN')
+
+        foreign_sku_edit = self.client.put(
+            f'/api/v1/skus/{foreign_sku.id}',
+            {'name': 'Stolen SKU'},
+            format='json',
+            **self.headers,
+        )
+        self.assertEqual(foreign_sku_edit.status_code, 403)
+
+        foreign_product.refresh_from_db()
+        foreign_sku.refresh_from_db()
+        self.assertEqual(foreign_product.title, 'Foreign')
+        self.assertEqual(foreign_sku.name, 'SKU')
+
     def test_soft_delete_marks_product_and_hides_deleted_in_seller_list(self):
         product = self.create_product(status=Product.Status.MODERATED)
         sku = self.create_sku(product)
@@ -863,98 +982,3 @@ class B2BApiTests(TestCase):
         self.assertEqual(fetched.status_code, 200)
         self.assertEqual(fetched.data['email'], 'seller@example.com')
         self.assertTrue(SellerProfile.objects.filter(seller_id=self.seller_id).exists())
-
-    def test_edit_moderated_product_returns_to_on_moderation(self):
-        product = self.create_product(status=Product.Status.MODERATED)
-        self.create_sku(product, active_quantity=3)
-
-        response = self.client.put(
-            f'/api/v1/products/{product.id}',
-            {'title': 'Edited title'},
-            format='json',
-            **self.headers,
-        )
-
-        self.assertEqual(response.status_code, 200)
-        product.refresh_from_db()
-        self.assertEqual(product.status, Product.Status.ON_MODERATION)
-
-        event = IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_UPDATED').order_by('-created_at').first()
-        self.assertIsNotNone(event)
-        self.assertEqual(event.payload['event_type'], 'EDITED')
-        self.assertEqual(event.payload['snapshot_before']['status'], Product.Status.MODERATED)
-        self.assertEqual(event.payload['snapshot_after']['status'], Product.Status.ON_MODERATION)
-
-    def test_edit_blocked_product_returns_to_on_moderation(self):
-        product = self.create_product(
-            status=Product.Status.BLOCKED,
-            blocking_reason={'title': 'Needs fixes'},
-            field_reports=[{'field': 'title', 'message': 'Fix title'}],
-        )
-        self.create_sku(product, active_quantity=2)
-
-        response = self.client.put(
-            f'/api/v1/products/{product.id}',
-            {'description': 'Updated after block'},
-            format='json',
-            **self.headers,
-        )
-
-        self.assertEqual(response.status_code, 200)
-        product.refresh_from_db()
-        self.assertEqual(product.status, Product.Status.ON_MODERATION)
-
-        event = IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_UPDATED').order_by('-created_at').first()
-        self.assertIsNotNone(event)
-        self.assertEqual(event.payload['event_type'], 'EDITED')
-        self.assertEqual(event.payload['snapshot_before']['status'], Product.Status.BLOCKED)
-        self.assertEqual(event.payload['snapshot_after']['status'], Product.Status.ON_MODERATION)
-
-    def test_reserves_preserved_after_sku_edit(self):
-        product = self.create_product(status=Product.Status.MODERATED)
-        sku = self.create_sku(product, reserved_quantity=4, active_quantity=7, price=1000)
-
-        response = self.client.put(
-            f'/api/v1/skus/{sku.id}',
-            {'name': 'Edited SKU name', 'price': 1200, 'active_quantity': 5},
-            format='json',
-            **self.headers,
-        )
-
-        self.assertEqual(response.status_code, 200)
-        sku.refresh_from_db()
-        product.refresh_from_db()
-        self.assertEqual(sku.reserved_quantity, 4)
-        self.assertEqual(product.status, Product.Status.ON_MODERATION)
-
-    def test_edit_hard_blocked_returns_403(self):
-        product = self.create_product(status=Product.Status.HARD_BLOCKED)
-        sku = self.create_sku(product, reserved_quantity=3)
-
-        product_response = self.client.put(
-            f'/api/v1/products/{product.id}',
-            {'title': 'Cannot edit'},
-            format='json',
-            **self.headers,
-        )
-        self.assertEqual(product_response.status_code, 403)
-
-        sku_response = self.client.put(
-            f'/api/v1/skus/{sku.id}',
-            {'name': 'Cannot edit sku'},
-            format='json',
-            **self.headers,
-        )
-        self.assertEqual(sku_response.status_code, 403)
-
-    def test_edit_others_product_returns_403(self):
-        product = self.create_product(seller_id=self.other_seller_id, status=Product.Status.MODERATED, title='Foreign product')
-
-        response = self.client.put(
-            f'/api/v1/products/{product.id}',
-            {'title': 'Try to edit foreign'},
-            format='json',
-            **self.headers,
-        )
-
-        self.assertEqual(response.status_code, 403)
