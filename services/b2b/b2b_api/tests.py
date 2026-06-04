@@ -6,7 +6,16 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from .management.commands.consume_moderation_events import Command as ModerationConsumerCommand
-from .models import Category, IntegrationInbox, IntegrationOutbox, Invoice, Product, SellerProfile, Sku
+from .models import (
+    Category,
+    IntegrationInbox,
+    IntegrationOutbox,
+    InventoryOperation,
+    Invoice,
+    Product,
+    SellerProfile,
+    Sku,
+)
 
 
 class B2BApiTests(TestCase):
@@ -798,6 +807,77 @@ class B2BApiTests(TestCase):
         self.assertEqual(sku.active_quantity, 8)
         self.assertEqual(sku.reserved_quantity, 2)
         self.assertEqual(sku.active_quantity + sku.reserved_quantity, 10)
+
+    def _post_fulfill(self, order_id, items, headers=None):
+        return self.client.post(
+            '/api/v1/fulfill',
+            {'order_id': order_id, 'items': items},
+            format='json',
+            **(headers if headers is not None else self.service_headers),
+        )
+
+    def test_fulfill_decreases_reserved_quantity(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        sku = self.create_sku(product, active_quantity=10, reserved_quantity=0)
+
+        self.assertEqual(self._post_reserve('reserve-fulfill-1', [{'sku_id': str(sku.id), 'quantity': 5}]).status_code, 200)
+        sku.refresh_from_db()
+        self.assertEqual(sku.reserved_quantity, 5)
+
+        response = self._post_fulfill('order-fulfill-1', [{'sku_id': str(sku.id), 'quantity': 2}])
+        self.assertEqual(response.status_code, 200)
+
+        sku.refresh_from_db()
+        self.assertEqual(sku.reserved_quantity, 3)
+
+    def test_active_quantity_unchanged(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        sku = self.create_sku(product, active_quantity=10, reserved_quantity=0)
+
+        self.assertEqual(self._post_reserve('reserve-fulfill-2', [{'sku_id': str(sku.id), 'quantity': 4}]).status_code, 200)
+        sku.refresh_from_db()
+        active_after_reserve = sku.active_quantity
+        self.assertEqual(active_after_reserve, 6)
+        self.assertEqual(sku.reserved_quantity, 4)
+
+        response = self._post_fulfill('order-fulfill-2', [{'sku_id': str(sku.id), 'quantity': 3}])
+        self.assertEqual(response.status_code, 200)
+
+        sku.refresh_from_db()
+        self.assertEqual(sku.active_quantity, active_after_reserve)
+        self.assertEqual(sku.reserved_quantity, 1)
+
+    def test_idempotent_fulfill_no_double_deduction(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        sku = self.create_sku(product, active_quantity=8, reserved_quantity=0)
+
+        self.assertEqual(self._post_reserve('reserve-fulfill-3', [{'sku_id': str(sku.id), 'quantity': 3}]).status_code, 200)
+        items = [{'sku_id': str(sku.id), 'quantity': 2}]
+        first = self._post_fulfill('order-fulfill-3', items)
+        self.assertEqual(first.status_code, 200)
+
+        sku.refresh_from_db()
+        self.assertEqual(sku.reserved_quantity, 1)
+        op_count = InventoryOperation.objects.filter(key='FULFILL:order-fulfill-3').count()
+
+        duplicate = self._post_fulfill('order-fulfill-3', items)
+        self.assertEqual(duplicate.status_code, 200)
+        self.assertEqual(duplicate.data, first.data)
+
+        sku.refresh_from_db()
+        self.assertEqual(sku.reserved_quantity, 1)
+        self.assertEqual(InventoryOperation.objects.filter(key='FULFILL:order-fulfill-3').count(), op_count)
+
+    def test_fulfill_missing_service_key_returns_401(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        sku = self.create_sku(product, active_quantity=5, reserved_quantity=2)
+
+        response = self._post_fulfill('order-no-key', [{'sku_id': str(sku.id), 'quantity': 1}], headers={})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.data['code'], 'UNAUTHORIZED')
+
+        sku.refresh_from_db()
+        self.assertEqual(sku.reserved_quantity, 2)
 
     def _create_catalog_visibility_fixtures(self):
         visible_product = self.create_product(status=Product.Status.MODERATED, title='Visible')
