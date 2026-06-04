@@ -91,7 +91,11 @@ paths:
 
   /api/v1/products/{id}/approve:
     post:
-      summary: Одобрить товар
+      summary: Одобрить товар (IN_REVIEW → MODERATED)
+      description: |
+        Одобряет карточку в статусе IN_REVIEW, закреплённую за текущим модератором.
+        Синхронно отправляет решение MODERATED в B2B (`POST /api/v1/moderation/events`).
+        Идемпотентность: `idempotency_key` = `approve:{card_id}`.
       tags: [Decisions]
       parameters:
         - name: id
@@ -114,8 +118,42 @@ paths:
                   status:
                     type: string
                     example: MODERATED
+        "403":
+          description: Карточка закреплена за другим модератором
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                code: APPROVE_NOT_ASSIGNED
+                message: Card is assigned to another moderator
         "404":
-          description: Товар не найден в очереди
+          description: Нет карточки IN_REVIEW для товара
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Нельзя одобрить (нет SKU, правки продавца во время review)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                after_edited:
+                  value:
+                    code: APPROVE_AFTER_EDITED
+                    message: Seller edited the product during review
+                without_sku:
+                  value:
+                    code: APPROVE_WITHOUT_SKU
+                    message: Product must have at least one active SKU
+        "503":
+          description: B2B недоступен — карточка остаётся IN_REVIEW
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/v1/products/{id}/decline:
     post:
@@ -305,6 +343,39 @@ components:
           type: string
           format: uuid
           nullable: true
+
+    ModerationDecisionEvent:
+      type: object
+      required: [idempotency_key, product_id, status]
+      description: Исходящее событие одобрения в B2B (US-MOD-03)
+      properties:
+        idempotency_key:
+          type: string
+          maxLength: 128
+          example: "approve:6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+        product_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [MODERATED]
+        hard_block:
+          type: boolean
+          default: false
+        blocking_reason:
+          nullable: true
+        field_reports:
+          type: array
+          items:
+            type: object
+
+    ErrorResponse:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
 
     EnqueueRequest:
       type: object

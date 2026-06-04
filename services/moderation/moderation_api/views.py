@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from django.db import transaction
+from .approve import ApproveError, approve_product
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from jwt import InvalidTokenError
@@ -135,43 +136,17 @@ class ModerationEnqueueView(APIView):
 class ProductApproveView(APIView):
     serializer_class = ModerationCardSerializer
 
-    @transaction.atomic
     def post(self, request, id):
         auth_context, error = _authorize_moderator(request)
         if error:
             return error
 
-        moderator = auth_context.actor
+        try:
+            result = approve_product(id, auth_context.actor)
+        except ApproveError as exc:
+            return _error(exc.message, exc.code, exc.http_status)
 
-        open_cards = _open_cards_queryset(id)
-        if not open_cards.exists():
-            return _error('Product is not found in moderation queue', 'NOT_FOUND', status.HTTP_404_NOT_FOUND)
-
-        decided_at = datetime.now(timezone.utc)
-        open_cards.update(
-            queue_status=ModerationCard.QueueStatus.APPROVED,
-            decided_by=moderator,
-            decided_at=decided_at,
-            updated_at=decided_at,
-        )
-
-        idempotency_key = str(uuid4())
-        ModerationEvent.objects.create(
-            event_type=ModerationEvent.EventType.PRODUCT_APPROVED,
-            product_id=id,
-            payload={
-                'idempotency_key': idempotency_key,
-                'product_id': str(id),
-                'moderated_at': decided_at.isoformat(),
-                'moderator': moderator,
-                'result': 'MODERATED',
-                'status': 'MODERATED',
-                'blocking_reason': None,
-                'field_reports': [],
-            },
-        )
-
-        return Response({'product_id': id, 'status': 'MODERATED'})
+        return Response(result)
 
 
 @extend_schema_view(
