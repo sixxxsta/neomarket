@@ -433,8 +433,48 @@ class CartApiTests(TestCase):
         self.assertEqual(response.status_code, 204)
         self.assertEqual(BannerEvent.objects.count(), 2)
 
+    def test_collections_list_returns_metadata_without_products(self):
+        active_high = Collection.objects.create(
+            title="Хиты",
+            description="Топ продаж",
+            cover_image_url="/hits.jpg",
+            target_url="/collections/hits",
+            priority=10,
+            is_active=True,
+        )
+        Collection.objects.create(title="Черновик", is_active=False, priority=5)
+        CollectionProduct.objects.create(collection=active_high, product_id=uuid.uuid4(), ordering=1)
+
+        response = self.client.get("/api/v1/main/collections?limit=10&offset=0")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("metadata", response.data)
+        self.assertIn("collections", response.data)
+        self.assertEqual(response.data["metadata"]["total_count"], 1)
+        self.assertEqual(len(response.data["collections"]), 1)
+        entry = response.data["collections"][0]
+        self.assertEqual(entry["title"], "Хиты")
+        self.assertEqual(entry["priority"], 10)
+        self.assertNotIn("items", entry)
+        self.assertNotIn("products", entry)
+        self.assertNotIn("skus", entry)
+
     @patch("cart_api.views.requests.get")
-    def test_collection_products_returns_unavailable_ids(self, mock_get):
+    def test_collection_products_enriched_from_b2b(self, mock_get):
+        collection = Collection.objects.create(title="Новинки", is_active=True)
+        product_id = uuid.uuid4()
+        CollectionProduct.objects.create(collection=collection, product_id=product_id, ordering=1)
+        mock_get.return_value = self._mock_response({"items": [self._catalog_product(product_id=product_id)]})
+
+        response = self.client.get(f"/api/v1/collections/{collection.id}/products?limit=20&offset=0")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["collection_title"], "Новинки")
+        self.assertEqual(len(response.data["items"]), 1)
+        self.assertEqual(response.data["items"][0]["title"], "Neo Phone X")
+        self.assertEqual(response.data["total_products"], 1)
+        self.assertEqual(response.data["unavailable_ids"], [])
+
+    @patch("cart_api.views.requests.get")
+    def test_unavailable_products_in_unavailable_ids(self, mock_get):
         collection = Collection.objects.create(title="Новинки", is_active=True)
         visible_id = uuid.uuid4()
         hidden_id = uuid.uuid4()
@@ -446,6 +486,30 @@ class CartApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data["items"]), 1)
         self.assertEqual(response.data["unavailable_ids"], [str(hidden_id)])
+
+    @patch("cart_api.views.requests.get")
+    def test_all_unavailable_products_returns_empty_items(self, mock_get):
+        collection = Collection.objects.create(title="Пустая витрина", is_active=True)
+        missing_a = uuid.uuid4()
+        missing_b = uuid.uuid4()
+        CollectionProduct.objects.create(collection=collection, product_id=missing_a, ordering=1)
+        CollectionProduct.objects.create(collection=collection, product_id=missing_b, ordering=2)
+        mock_get.return_value = self._mock_response({"items": []})
+
+        response = self.client.get(f"/api/v1/collections/{collection.id}/products")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["items"], [])
+        self.assertEqual(set(response.data["unavailable_ids"]), {str(missing_a), str(missing_b)})
+
+    def test_unknown_collection_returns_404(self):
+        unknown_id = uuid.uuid4()
+        response = self.client.get(f"/api/v1/collections/{unknown_id}/products")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.data["code"], "COLLECTION_NOT_FOUND")
+
+        inactive = Collection.objects.create(title="Скрытая", is_active=False)
+        inactive_response = self.client.get(f"/api/v1/collections/{inactive.id}/products")
+        self.assertEqual(inactive_response.status_code, 404)
 
     @patch("cart_api.views.requests.get")
     def test_product_event_marks_cart_items_unavailable_and_is_idempotent(self, mock_get):
