@@ -6,7 +6,7 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from .management.commands.consume_moderation_events import Command as ModerationConsumerCommand
-from .models import Category, IntegrationInbox, IntegrationOutbox, Product, SellerProfile, Sku
+from .models import Category, IntegrationInbox, IntegrationOutbox, Invoice, Product, SellerProfile, Sku
 
 
 class B2BApiTests(TestCase):
@@ -720,34 +720,60 @@ class B2BApiTests(TestCase):
         self.assertEqual(ids_response.data['total'], 1)
         self.assertEqual(ids_response.data['items'][0]['id'], str(visible_product.id))
 
-    def test_invoice_requires_moderated_owned_sku(self):
+    def _post_invoice(self, **extra):
+        payload = {
+            'warehouse_id': str(uuid.uuid4()),
+            'items': [{'sku_id': str(uuid.uuid4()), 'quantity': 1}],
+        }
+        payload.update(extra)
+        return self.client.post('/api/v1/invoices', payload, format='json', **self.headers)
+
+    def test_create_invoice_with_moderated_sku_returns_201(self):
+        product = self.create_product(status=Product.Status.MODERATED, title='Stock intake')
+        sku = self.create_sku(product, active_quantity=2)
+        warehouse_id = uuid.uuid4()
+
+        response = self._post_invoice(
+            warehouse_id=str(warehouse_id),
+            items=[{'sku_id': str(sku.id), 'quantity': 5}],
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['status'], 'PENDING')
+        self.assertEqual(str(response.data['warehouse_id']), str(warehouse_id))
+        self.assertEqual(str(response.data['seller_id']), str(self.seller_id))
+        self.assertEqual(len(response.data['items']), 1)
+        self.assertEqual(response.data['items'][0]['sku_id'], str(sku.id))
+        self.assertEqual(response.data['items'][0]['quantity'], 5)
+        self.assertIsNone(response.data['accepted_at'])
+
+        invoice = Invoice.objects.get(id=response.data['id'])
+        self.assertEqual(invoice.status, Invoice.Status.PENDING)
+        self.assertEqual(invoice.items.count(), 1)
+
+    def test_empty_items_returns_400(self):
+        response = self._post_invoice(items=[])
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'BAD_REQUEST')
+
+    def test_non_moderated_sku_returns_400(self):
         created_product = self.create_product(status=Product.Status.CREATED)
         created_sku = self.create_sku(created_product)
 
-        response = self.client.post(
-            '/api/v1/invoices',
-            {
-                'warehouse_id': str(uuid.uuid4()),
-                'items': [{'sku_id': str(created_sku.id), 'quantity': 2}],
-            },
-            format='json',
-            **self.headers,
-        )
+        response = self._post_invoice(items=[{'sku_id': str(created_sku.id), 'quantity': 2}])
         self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data['code'], 'BAD_REQUEST')
 
-        foreign_product = self.create_product(seller_id=self.other_seller_id, status=Product.Status.MODERATED, title='Foreign')
+    def test_others_sku_returns_403(self):
+        foreign_product = self.create_product(
+            seller_id=self.other_seller_id,
+            status=Product.Status.MODERATED,
+            title='Foreign',
+        )
         foreign_sku = self.create_sku(foreign_product)
 
-        foreign_response = self.client.post(
-            '/api/v1/invoices',
-            {
-                'warehouse_id': str(uuid.uuid4()),
-                'items': [{'sku_id': str(foreign_sku.id), 'quantity': 1}],
-            },
-            format='json',
-            **self.headers,
-        )
-        self.assertEqual(foreign_response.status_code, 403)
+        response = self._post_invoice(items=[{'sku_id': str(foreign_sku.id), 'quantity': 1}])
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data['code'], 'FORBIDDEN')
 
     def test_seller_list_ignores_query_seller_id_and_supports_status_filter(self):
         own_blocked = self.create_product(title='Own blocked', status=Product.Status.BLOCKED)

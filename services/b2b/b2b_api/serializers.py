@@ -248,6 +248,11 @@ class CreateInvoiceRequestSerializer(serializers.Serializer):
     warehouse_id = serializers.UUIDField()
     items = InvoiceItemRequestSerializer(many=True, allow_empty=False)
 
+    def validate(self, attrs):
+        if not attrs.get('items'):
+            raise serializers.ValidationError({'items': 'At least one invoice item is required.'})
+        return attrs
+
 
 class AcceptInvoiceRequestSerializer(serializers.Serializer):
     invoice_id = serializers.UUIDField()

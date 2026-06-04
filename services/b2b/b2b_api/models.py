@@ -71,6 +71,7 @@ class Sku(models.Model):
 
 class Invoice(models.Model):
     class Status(models.TextChoices):
+        PENDING = 'PENDING', 'PENDING'
         CREATED = 'CREATED', 'CREATED'
         ACCEPTED = 'ACCEPTED', 'ACCEPTED'
         REJECTED = 'REJECTED', 'REJECTED'
@@ -78,7 +79,7 @@ class Invoice(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     seller_id = models.UUIDField(db_index=True)
     warehouse_id = models.UUIDField(db_index=True)
-    status = models.CharField(max_length=16, choices=Status.choices, default=Status.CREATED, db_index=True)
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     accepted_at = models.DateTimeField(null=True, blank=True)
 
