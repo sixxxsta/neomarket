@@ -771,3 +771,66 @@ class HardBlockApiTests(TestCase):
                 queue_status=ModerationCard.QueueStatus.ARCHIVED,
             ).exists()
         )
+
+
+class BlockingReasonsApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {build_test_token()}')
+
+    def test_list_returns_active_reasons(self):
+        response = self.client.get('/api/v1/product-blocking-reasons')
+        self.assertEqual(response.status_code, 200)
+
+        codes = {item['blocking_reason_id'] for item in response.data}
+        self.assertIn('BAD_MEDIA', codes)
+        self.assertIn('FORBIDDEN_CONTENT', codes)
+
+        bad_media = next(item for item in response.data if item['blocking_reason_id'] == 'BAD_MEDIA')
+        self.assertEqual(bad_media['title'], 'Некачественные фото')
+        self.assertFalse(bad_media['hard_block'])
+
+        forbidden = next(item for item in response.data if item['blocking_reason_id'] == 'FORBIDDEN_CONTENT')
+        self.assertTrue(forbidden['hard_block'])
+
+    def test_inactive_reasons_not_visible(self):
+        BlockingReason.objects.create(
+            code='RETIRED_REASON',
+            title='Снятая причина',
+            is_active=False,
+            hard_only=False,
+        )
+
+        response = self.client.get('/api/v1/product-blocking-reasons')
+        self.assertEqual(response.status_code, 200)
+        codes = {item['blocking_reason_id'] for item in response.data}
+        self.assertNotIn('RETIRED_REASON', codes)
+
+    def test_list_filters_by_hard_block(self):
+        soft = self.client.get('/api/v1/product-blocking-reasons', {'hard_block': 'false'})
+        hard = self.client.get('/api/v1/product-blocking-reasons', {'hard_block': 'true'})
+
+        self.assertEqual(soft.status_code, 200)
+        self.assertEqual(hard.status_code, 200)
+        self.assertTrue(all(not item['hard_block'] for item in soft.data))
+        self.assertTrue(all(item['hard_block'] for item in hard.data))
+        self.assertIn('FORBIDDEN_CONTENT', {item['blocking_reason_id'] for item in hard.data})
+        self.assertNotIn('FORBIDDEN_CONTENT', {item['blocking_reason_id'] for item in soft.data})
+
+    def test_referenced_reason_cannot_be_deleted(self):
+        reason = BlockingReason.objects.get(code='BAD_MEDIA')
+        ModerationCard.objects.create(
+            product_id=uuid4(),
+            event_type=ModerationCard.EventType.CREATED,
+            queue_status=ModerationCard.QueueStatus.DECLINED,
+            decline_reason=reason,
+            snapshot_after={'id': str(uuid4()), 'status': 'BLOCKED'},
+        )
+
+        from django.db.models.deletion import ProtectedError
+
+        with self.assertRaises(ProtectedError):
+            reason.delete()
+
+        reason.refresh_from_db()
+        self.assertTrue(reason.is_active)

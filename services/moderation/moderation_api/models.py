@@ -21,6 +21,16 @@ class BlockingReason(models.Model):
     def __str__(self):
         return self.title
 
+    def delete(self, *args, **kwargs):
+        from django.db.models.deletion import ProtectedError
+
+        if ModerationCard.objects.filter(decline_reason=self).exists():
+            raise ProtectedError(
+                'Blocking reason is referenced by moderation cards; deactivate instead of deleting.',
+                [self],
+            )
+        return super().delete(*args, **kwargs)
+
 
 class ModerationCard(models.Model):
     class EventType(models.TextChoices):

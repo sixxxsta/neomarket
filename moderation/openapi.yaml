@@ -225,17 +225,35 @@ paths:
 
   /api/v1/product-blocking-reasons:
     get:
-      summary: Список причин блокировки
+      summary: Справочник причин блокировки (US-MOD-06)
+      description: |
+        Возвращает только активные причины (`is_active=true`).
+        `hard_block=true` — только для жёсткой блокировки (US-MOD-05);
+        `hard_block=false` — только для мягкой (US-MOD-04).
+        Удаление в админке запрещено при исторических ссылках — деактивируйте.
       tags: [Reference]
+      parameters:
+        - name: hard_block
+          in: query
+          required: false
+          schema:
+            type: boolean
+          description: Фильтр по типу блокировки (soft vs hard)
       responses:
         "200":
-          description: Список причин
+          description: Список активных причин
           content:
             application/json:
               schema:
                 type: array
                 items:
                   $ref: "#/components/schemas/BlockingReason"
+        "400":
+          description: Невалидный параметр hard_block
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/v1/product-moderation/enqueue:
     post:
@@ -295,13 +313,18 @@ components:
 
     BlockingReason:
       type: object
+      required: [blocking_reason_id, title, hard_block]
       properties:
-        code:
+        blocking_reason_id:
           type: string
+          description: Стабильный id причины (slug), используется в decline
         title:
           type: string
         description:
           type: string
+        hard_block:
+          type: boolean
+          description: true — только hard decline (US-MOD-05); false — soft (US-MOD-04)
 
     DeclineRequest:
       type: object
