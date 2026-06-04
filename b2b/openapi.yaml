@@ -1182,7 +1182,7 @@ components:
 
     CreateSkuRequest:
       type: object
-      required: [product_id, name, price, cost_price, active_quantity, images]
+      required: [product_id, name, price, images]
       properties:
         product_id:
           type: string

@@ -226,7 +226,7 @@ class CreateSkuRequestSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=255)
     price = serializers.IntegerField(min_value=0)
     cost_price = serializers.IntegerField(min_value=0, required=False, default=0)
-    active_quantity = serializers.IntegerField(min_value=0)
+    active_quantity = serializers.IntegerField(min_value=0, required=False, default=0)
     images = serializers.ListField(child=serializers.DictField(), required=True)
     characteristics = serializers.ListField(child=serializers.DictField(), required=False)
 

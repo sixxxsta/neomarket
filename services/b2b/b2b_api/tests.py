@@ -218,6 +218,23 @@ class B2BApiTests(TestCase):
         self.assertEqual(response.status_code, 400)
         self._assert_bad_request_field(response, 'images')
 
+    def test_create_sku_without_active_quantity_defaults_to_zero(self):
+        created = self.create_product_via_api()
+        payload = {
+            'product_id': str(created.data['id']),
+            'name': 'SKU no stock field',
+            'price': 100,
+            'cost_price': 60,
+            'images': [{'url': 'https://example.com/sku-no-qty.jpg'}],
+        }
+        response = self.client.post('/api/v1/skus', payload, format='json', **self.headers)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['active_quantity'], 0)
+        self.assertEqual(response.data['stock_quantity'], 0)
+
+        sku = Sku.objects.get(id=response.data['id'])
+        self.assertEqual(sku.active_quantity, 0)
+
     def test_first_sku_transitions_product_to_on_moderation(self):
         created = self.create_product_via_api()
         self.assertEqual(created.status_code, 201)
