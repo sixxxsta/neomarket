@@ -86,6 +86,7 @@ MODERATION_EVENTS_GROUP = os.getenv('MODERATION_EVENTS_GROUP', 'moderation')
 MODERATION_EVENTS_CONSUMER = os.getenv('MODERATION_EVENTS_CONSUMER', 'moderation-1')
 EVENT_SOURCE = 'moderation'
 INTERNAL_SERVICE_KEY = os.getenv('INTERNAL_SERVICE_KEY', 'neomarket-internal-key')
+MODERATION_IN_REVIEW_TIMEOUT_MINUTES = int(os.getenv('MODERATION_IN_REVIEW_TIMEOUT_MINUTES', '30'))
 
 JWT_ALGORITHM = os.getenv('JWT_ALGORITHM', 'HS256')
 JWT_SECRET = os.getenv('JWT_SECRET', 'moderation-dev-jwt-secret')

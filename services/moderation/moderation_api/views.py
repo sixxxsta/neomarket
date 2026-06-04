@@ -11,11 +11,13 @@ from rest_framework.views import APIView
 
 from .auth import authenticate_request, has_any_role
 from .models import BlockingReason, ModerationCard, ModerationEvent
+from .get_next import acquire_next_card
 from .product_events import apply_product_event
 from .serializers import (
     BlockingReasonSerializer,
     DeclineRequestSerializer,
     EnqueueRequestSerializer,
+    GetNextRequestSerializer,
     ModerationCardSerializer,
 )
 
@@ -58,46 +60,34 @@ def _open_cards_queryset(product_id):
 
 
 @extend_schema_view(
-    post=extend_schema(operation_id='moderation_get_next_card', responses=OpenApiTypes.OBJECT),
+    post=extend_schema(
+        operation_id='moderation_get_next_card',
+        request=GetNextRequestSerializer,
+        responses=ModerationCardSerializer,
+    ),
 )
 class ModerationNextCardView(APIView):
     serializer_class = ModerationCardSerializer
 
-    @transaction.atomic
     def post(self, request):
         auth_context, error = _authorize_moderator(request)
         if error:
             return error
 
+        serializer = GetNextRequestSerializer(data=request.data or {})
+        if not serializer.is_valid():
+            return _error('Invalid get-next payload', 'BAD_REQUEST', status.HTTP_400_BAD_REQUEST)
+
         moderator = auth_context.actor
-
-        # Та же сессия модератора после обновления страницы: вернуть уже взятый IN_REVIEW,
-        # иначе get-next смотрит только на PENDING и очередь выглядит «пустой».
-        existing = (
-            ModerationCard.objects.select_for_update(skip_locked=True)
-            .filter(
-                queue_status=ModerationCard.QueueStatus.IN_REVIEW,
-                assigned_to=moderator,
+        card, error_code = acquire_next_card(moderator, serializer.validated_data.get('queue_id'))
+        if error_code == 'MODERATOR_ALREADY_HAS_CARD':
+            return _error(
+                'Moderator already has a card in review',
+                'MODERATOR_ALREADY_HAS_CARD',
+                status.HTTP_409_CONFLICT,
             )
-            .order_by('updated_at')
-            .first()
-        )
-        if existing:
-            return Response(ModerationCardSerializer(existing).data)
-
-        card = (
-            ModerationCard.objects.select_for_update(skip_locked=True)
-            .filter(queue_status=ModerationCard.QueueStatus.PENDING)
-            .order_by('created_at')
-            .first()
-        )
-        if not card:
+        if error_code == 'QUEUE_EMPTY':
             return Response(status=status.HTTP_204_NO_CONTENT)
-
-        card.queue_status = ModerationCard.QueueStatus.IN_REVIEW
-        card.assigned_to = moderator
-        card.save(update_fields=['queue_status', 'assigned_to', 'updated_at'])
-
         return Response(ModerationCardSerializer(card).data)
 
 
@@ -121,11 +111,20 @@ class ModerationEnqueueView(APIView):
         if not serializer.is_valid():
             return _error('Invalid enqueue payload', 'BAD_REQUEST', status.HTTP_400_BAD_REQUEST)
 
+        from .queue import compute_priority_queue
+
+        product_id = serializer.validated_data['product_id']
+        snapshot_after = serializer.validated_data.get('snapshot_after') or {'id': str(product_id)}
         card = ModerationCard.objects.create(
-            product_id=serializer.validated_data['product_id'],
+            product_id=product_id,
             event_type=serializer.validated_data['event_type'],
+            priority_queue=compute_priority_queue(
+                product_id,
+                serializer.validated_data['event_type'],
+                snapshot_after,
+            ),
             snapshot_before=serializer.validated_data.get('snapshot_before'),
-            snapshot_after=serializer.validated_data.get('snapshot_after') or {'id': str(serializer.validated_data['product_id'])},
+            snapshot_after=snapshot_after,
         )
         return Response(ModerationCardSerializer(card).data, status=status.HTTP_201_CREATED)
 

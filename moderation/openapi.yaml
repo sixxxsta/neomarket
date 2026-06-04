@@ -53,7 +53,20 @@ paths:
   /api/v1/product-moderation/get-next:
     post:
       summary: Следующая карточка из очереди
+      description: |
+        Выдаёт самую старую `PENDING` карточку (с учётом приоритетных очередей 1→4),
+        переводит в `IN_REVIEW` и закрепляет за модератором (`SELECT FOR UPDATE SKIP LOCKED`).
+
+        Опциональный `queue_id` (1–4): новые / после блокировки / в наличии / не в наличии.
+        Если модератор уже держит активную `IN_REVIEW` (в пределах таймаута) — **409**.
+        Просроченные `IN_REVIEW` возвращаются в `PENDING` автоматически.
       tags: [Queue]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetNextRequest"
       responses:
         "200":
           description: Карточка для проверки
@@ -63,6 +76,18 @@ paths:
                 $ref: "#/components/schemas/ModerationCard"
         "204":
           description: Очередь пуста
+        "409":
+          description: У модератора уже есть карточка в IN_REVIEW
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    example: MODERATOR_ALREADY_HAS_CARD
+                  message:
+                    type: string
 
   /api/v1/products/{id}/approve:
     post:
@@ -177,6 +202,10 @@ components:
         queue_status:
           type: string
           enum: [PENDING, IN_REVIEW, APPROVED, DECLINED, ARCHIVED]
+        priority_queue:
+          type: integer
+          minimum: 1
+          maximum: 4
         snapshot_before:
           type: object
           nullable: true
@@ -252,6 +281,19 @@ components:
           type: object
           nullable: true
           additionalProperties: true
+
+    GetNextRequest:
+      type: object
+      properties:
+        queue_id:
+          type: integer
+          minimum: 1
+          maximum: 4
+          nullable: true
+          description: |
+            1 — новые, 2 — исправленные после блокировки,
+            3 — изменённые (в наличии), 4 — изменённые (не в наличии).
+            null — автоприоритизация 1→4.
 
     ProductEventAccepted:
       type: object

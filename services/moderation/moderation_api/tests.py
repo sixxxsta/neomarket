@@ -1,18 +1,20 @@
+from datetime import timedelta
 from uuid import uuid4
 
 import json
 import jwt
 from django.conf import settings
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from .models import ModerationCard, ModerationEvent
 from .queue import enqueue_from_event, parse_event
 
 
-def build_test_token():
+def build_test_token(moderator_id=None):
     payload = {
-        'sub': str(uuid4()),
+        'sub': str(moderator_id or uuid4()),
         'roles': ['MODERATOR'],
     }
     if settings.JWT_ISSUER:
@@ -52,31 +54,6 @@ class ModerationApiTests(TestCase):
         event = ModerationEvent.objects.get(product_id=product_id)
         self.assertEqual(event.event_type, ModerationEvent.EventType.PRODUCT_APPROVED)
         self.assertTrue(event.payload['idempotency_key'])
-
-    def test_get_next_resumes_same_moderator_in_review_card(self):
-        """После get-next карточка IN_REVIEW; повторный get-next тем же модератором не должен отдавать 204."""
-        product_id = str(uuid4())
-
-        enqueue = self.client.post(
-            '/api/v1/product-moderation/enqueue',
-            {
-                'product_id': product_id,
-                'event_type': 'CREATED',
-                'snapshot_after': {'id': product_id, 'title': 'Demo'},
-            },
-            format='json',
-        )
-        self.assertEqual(enqueue.status_code, 201)
-
-        first = self.client.post('/api/v1/product-moderation/get-next', {}, format='json')
-        self.assertEqual(first.status_code, 200)
-        self.assertEqual(first.data['queue_status'], 'IN_REVIEW')
-        cid = first.data['id']
-
-        second = self.client.post('/api/v1/product-moderation/get-next', {}, format='json')
-        self.assertEqual(second.status_code, 200)
-        self.assertEqual(second.data['id'], cid)
-        self.assertEqual(second.data['product_id'], product_id)
 
     def test_parse_event_product_id_from_aggregate_id(self):
         pid = str(uuid4())
@@ -295,3 +272,78 @@ class ProductEventsApiTests(TestCase):
         response = self._post_event(self._event_payload('CREATED'))
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.data['code'], 'UNAUTHORIZED')
+
+
+class GetNextApiTests(TestCase):
+    def _client_for(self, moderator_id):
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Bearer {build_test_token(moderator_id)}')
+        return client
+
+    def _pending_card(self, product_id=None, priority_queue=1, created_at=None):
+        product_id = product_id or uuid4()
+        card = ModerationCard.objects.create(
+            product_id=product_id,
+            event_type=ModerationCard.EventType.CREATED,
+            queue_status=ModerationCard.QueueStatus.PENDING,
+            priority_queue=priority_queue,
+            snapshot_after={
+                'id': str(product_id),
+                'title': 'Demo',
+                'status': 'ON_MODERATION',
+                'skus': [{'id': str(uuid4()), 'deleted': False, 'active_quantity': 1}],
+            },
+        )
+        if created_at:
+            ModerationCard.objects.filter(pk=card.pk).update(created_at=created_at)
+            card.refresh_from_db()
+        return card
+
+    def test_next_returns_oldest_pending(self):
+        moderator_id = uuid4()
+        client = self._client_for(moderator_id)
+        older_pid = uuid4()
+        newer_pid = uuid4()
+        self._pending_card(older_pid, created_at=timezone.now() - timedelta(hours=2))
+        self._pending_card(newer_pid, created_at=timezone.now() - timedelta(hours=1))
+
+        response = client.post('/api/v1/product-moderation/get-next', {}, format='json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['queue_status'], 'IN_REVIEW')
+        self.assertEqual(response.data['product_id'], str(older_pid))
+
+        card = ModerationCard.objects.get(product_id=older_pid)
+        self.assertEqual(card.assigned_to, str(moderator_id))
+        self.assertIsNotNone(card.review_started_at)
+
+    def test_concurrent_two_moderators_get_different_cards(self):
+        mod_a = uuid4()
+        mod_b = uuid4()
+        client_a = self._client_for(mod_a)
+        client_b = self._client_for(mod_b)
+        self._pending_card(uuid4())
+        self._pending_card(uuid4())
+
+        first_a = client_a.post('/api/v1/product-moderation/get-next', {}, format='json')
+        first_b = client_b.post('/api/v1/product-moderation/get-next', {}, format='json')
+        self.assertEqual(first_a.status_code, 200)
+        self.assertEqual(first_b.status_code, 200)
+        self.assertNotEqual(first_a.data['id'], first_b.data['id'])
+
+    def test_empty_queue_returns_204(self):
+        client = self._client_for(uuid4())
+        response = client.post('/api/v1/product-moderation/get-next', {}, format='json')
+        self.assertEqual(response.status_code, 204)
+
+    def test_moderator_already_has_in_review_returns_409(self):
+        moderator_id = uuid4()
+        client = self._client_for(moderator_id)
+        self._pending_card(uuid4())
+        self._pending_card(uuid4())
+
+        first = client.post('/api/v1/product-moderation/get-next', {}, format='json')
+        self.assertEqual(first.status_code, 200)
+
+        second = client.post('/api/v1/product-moderation/get-next', {}, format='json')
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(second.data['code'], 'MODERATOR_ALREADY_HAS_CARD')
