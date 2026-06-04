@@ -286,6 +286,75 @@ class B2BApiTests(TestCase):
             IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_UPDATED').exists()
         )
 
+    def test_add_sku_to_moderated_product_returns_to_on_moderation(self):
+        product = self.create_product(status=Product.Status.MODERATED)
+        self.create_sku(product, name='Existing SKU')
+
+        response = self._post_sku(
+            product.id,
+            name='New SKU variant',
+            price=1500,
+            active_quantity=3,
+            images=[{'url': 'https://example.com/new-sku.jpg'}],
+        )
+        self.assertEqual(response.status_code, 201)
+
+        product.refresh_from_db()
+        self.assertEqual(product.status, Product.Status.ON_MODERATION)
+        event = IntegrationOutbox.objects.filter(
+            aggregate_id=product.id,
+            event_type='PRODUCT_UPDATED',
+        ).order_by('-created_at').first()
+        self.assertIsNotNone(event)
+        self.assertEqual(event.payload['event_type'], 'EDITED')
+
+    def test_add_sku_to_blocked_product_returns_to_on_moderation(self):
+        product = self.create_product(status=Product.Status.BLOCKED)
+        self.create_sku(product, name='Blocked existing SKU')
+
+        response = self._post_sku(
+            product.id,
+            name='Recovery SKU',
+            images=[{'url': 'https://example.com/recovery-sku.jpg'}],
+        )
+        self.assertEqual(response.status_code, 201)
+
+        product.refresh_from_db()
+        self.assertEqual(product.status, Product.Status.ON_MODERATION)
+
+    def test_create_sku_response_matches_sku_response_contract(self):
+        created = self.create_product_via_api()
+        response = self._post_sku(
+            created.data['id'],
+            name='Contract SKU',
+            price=999,
+            cost_price=500,
+            active_quantity=4,
+            characteristics=[{'name': 'article', 'value': 'ART-001'}],
+            images=[{'url': 'https://example.com/contract-sku.jpg'}],
+        )
+        self.assertEqual(response.status_code, 201)
+        for field in (
+            'id',
+            'product_id',
+            'name',
+            'price',
+            'discount',
+            'cost_price',
+            'stock_quantity',
+            'active_quantity',
+            'reserved_quantity',
+            'article',
+            'images',
+            'characteristics',
+            'created_at',
+            'updated_at',
+        ):
+            self.assertIn(field, response.data)
+        self.assertEqual(response.data['discount'], 0)
+        self.assertEqual(response.data['stock_quantity'], 4)
+        self.assertEqual(response.data['article'], 'ART-001')
+
     def test_soft_delete_marks_product_and_keeps_deleted_in_seller_list(self):
         product = self.create_product(status=Product.Status.MODERATED)
         sku = self.create_sku(product)
