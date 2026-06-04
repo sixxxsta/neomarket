@@ -230,21 +230,21 @@ def _serialize_cart_item(item, product, sku):
         image_url = sku.get("image") or product.get("images", [{}])[0].get("url") if product.get("images") else sku.get("image")
         available_stock = int(sku.get("active_quantity") or 0)
         unit_price = int(sku.get("price") or 0) - int(sku.get("discount") or 0)
-        if available_stock <= 0:
+        product_status = (product.get("status") or "").upper()
+        if product_status == "BLOCKED":
+            unavailable_reason = CartItem.UnavailableReason.PRODUCT_BLOCKED
+        elif product_status in {"ON_MODERATION", "PENDING_MODERATION"}:
+            unavailable_reason = CartItem.UnavailableReason.ON_MODERATION
+        elif available_stock <= 0:
+            unavailable_reason = CartItem.UnavailableReason.OUT_OF_STOCK
+        elif available_stock < int(item.quantity):
             unavailable_reason = CartItem.UnavailableReason.OUT_OF_STOCK
         else:
             line_total = unit_price * int(item.quantity)
     else:
-        unavailable_reason = item.unavailable_reason or CartItem.UnavailableReason.PRODUCT_DELETED
+        unavailable_reason = CartItem.UnavailableReason.PRODUCT_DELETED
 
-    if item.unavailable_reason and unavailable_reason is None:
-        item.unavailable_reason = None
-        item.save(update_fields=["unavailable_reason", "updated_at"])
-    elif unavailable_reason and item.unavailable_reason != unavailable_reason:
-        item.unavailable_reason = unavailable_reason
-        item.save(update_fields=["unavailable_reason", "updated_at"])
-
-    is_available = unavailable_reason is None and available_stock >= item.quantity
+    is_available = unavailable_reason is None
     image_ref = None
     if image_url:
         image_ref = {"id": str(item.sku_id), "url": image_url, "ordering": 0, "is_main": True}

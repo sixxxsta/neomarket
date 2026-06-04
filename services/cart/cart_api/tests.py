@@ -64,23 +64,102 @@ class CartApiTests(TestCase):
         self.assertEqual(response.status_code, 400)
 
     @patch("cart_api.views.requests.get")
-    def test_add_and_get_cart_item_with_jwt(self, mock_get):
-        product = self._catalog_product()
+    def test_add_sku_increments_quantity_if_already_in_cart(self, mock_get):
+        product = self._catalog_product(active_quantity=10)
         mock_get.return_value = self._mock_response({"items": [product]})
-        add_response = self.client.post(
+
+        first = self.client.post(
+            "/api/v1/cart/items",
+            {"sku_id": str(self.sku_id), "quantity": 1},
+            format="json",
+            HTTP_AUTHORIZATION=self.auth,
+        )
+        self.assertEqual(first.status_code, 200)
+
+        second = self.client.post(
             "/api/v1/cart/items",
             {"sku_id": str(self.sku_id), "quantity": 2},
             format="json",
             HTTP_AUTHORIZATION=self.auth,
         )
-        self.assertIn(add_response.status_code, [200, 201])
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.data["items"][0]["quantity"], 3)
+        self.assertEqual(CartItem.objects.filter(cart__user_id=self.user_id, sku_id=self.sku_id).count(), 1)
 
-        get_response = self.client.get("/api/v1/cart", HTTP_AUTHORIZATION=self.auth)
-        self.assertEqual(get_response.status_code, 200)
-        self.assertEqual(len(get_response.data["items"]), 1)
-        self.assertEqual(get_response.data["items"][0]["quantity"], 2)
-        self.assertEqual(get_response.data["items"][0]["product_id"], str(self.product_id))
-        self.assertEqual(get_response.data["summary"]["total_amount"], 25998000)
+    @patch("cart_api.views.requests.get")
+    def test_get_cart_enriched_with_b2b_data(self, mock_get):
+        product = self._catalog_product(active_quantity=5)
+        mock_get.return_value = self._mock_response({"items": [product]})
+        self.client.post(
+            "/api/v1/cart/items",
+            {"sku_id": str(self.sku_id), "quantity": 2},
+            format="json",
+            HTTP_AUTHORIZATION=self.auth,
+        )
+
+        response = self.client.get("/api/v1/cart", HTTP_AUTHORIZATION=self.auth)
+        self.assertEqual(response.status_code, 200)
+        item = response.data["items"][0]
+        self.assertEqual(item["product_id"], str(self.product_id))
+        self.assertEqual(item["product_title"], "Neo Phone X")
+        self.assertEqual(item["sku_name"], "Black 256GB")
+        self.assertEqual(item["unit_price"], 12999000)
+        self.assertEqual(item["available_stock"], 5)
+        self.assertTrue(item["available"])
+        self.assertEqual(response.data["summary"]["total_amount"], 25998000)
+
+    @patch("cart_api.views.requests.get")
+    def test_unavailable_sku_shown_with_reason(self, mock_get):
+        product = self._catalog_product(active_quantity=5)
+        mock_get.return_value = self._mock_response({"items": [product]})
+        self.client.post(
+            "/api/v1/cart/items",
+            {"sku_id": str(self.sku_id), "quantity": 2},
+            format="json",
+            HTTP_AUTHORIZATION=self.auth,
+        )
+
+        out_of_stock = self._catalog_product(active_quantity=0)
+        mock_get.return_value = self._mock_response({"items": [out_of_stock]})
+        response = self.client.get("/api/v1/cart", HTTP_AUTHORIZATION=self.auth)
+
+        self.assertEqual(response.status_code, 200)
+        item = response.data["items"][0]
+        self.assertFalse(item["available"])
+        self.assertEqual(item["unavailable_reason"], "OUT_OF_STOCK")
+        self.assertEqual(item["line_total"], 0)
+        self.assertEqual(response.data["summary"]["total_amount"], 0)
+        self.assertTrue(response.data["summary"]["has_unavailable_items"])
+
+    @patch("cart_api.views.requests.get")
+    def test_guest_cart_merged_on_login(self, mock_get):
+        session_id = uuid.uuid4()
+        guest_cart = Cart.objects.create(session_id=session_id)
+        CartItem.objects.create(
+            cart=guest_cart,
+            product_id=self.product_id,
+            sku_id=self.sku_id,
+            quantity=3,
+        )
+        user_cart = Cart.objects.create(user_id=self.user_id)
+        CartItem.objects.create(
+            cart=user_cart,
+            product_id=self.product_id,
+            sku_id=self.sku_id,
+            quantity=1,
+        )
+        mock_get.return_value = self._mock_response({"items": [self._catalog_product(active_quantity=10)]})
+
+        response = self.client.get(
+            "/api/v1/cart",
+            HTTP_AUTHORIZATION=self.auth,
+            HTTP_X_SESSION_ID=str(session_id),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["items"][0]["quantity"], 3)
+        self.assertFalse(Cart.objects.filter(session_id=session_id).exists())
+        self.assertEqual(CartItem.objects.filter(cart__user_id=self.user_id).count(), 1)
 
     def test_favorites_requires_user_identity(self):
         response = self.client.get("/api/v1/favorites")
@@ -266,9 +345,10 @@ class CartApiTests(TestCase):
         self.assertEqual(len(response.data["items"]), 1)
         self.assertEqual(response.data["unavailable_ids"], [str(hidden_id)])
 
-    def test_product_event_marks_cart_items_unavailable_and_is_idempotent(self):
+    @patch("cart_api.views.requests.get")
+    def test_product_event_marks_cart_items_unavailable_and_is_idempotent(self, mock_get):
         cart = Cart.objects.create(user_id=self.user_id)
-        item = CartItem.objects.create(cart=cart, product_id=self.product_id, sku_id=self.sku_id, quantity=1)
+        CartItem.objects.create(cart=cart, product_id=self.product_id, sku_id=self.sku_id, quantity=1)
         payload = {
             "idempotency_key": "evt-1",
             "event": "PRODUCT_BLOCKED",
@@ -285,8 +365,14 @@ class CartApiTests(TestCase):
             HTTP_X_SERVICE_KEY=settings.INTERNAL_SERVICE_KEY,
         )
         self.assertEqual(first.status_code, 200)
-        item.refresh_from_db()
-        self.assertEqual(item.unavailable_reason, "PRODUCT_BLOCKED")
+
+        blocked = self._catalog_product()
+        blocked["status"] = "BLOCKED"
+        mock_get.return_value = self._mock_response({"items": [blocked]})
+        cart_response = self.client.get("/api/v1/cart", HTTP_AUTHORIZATION=self.auth)
+        self.assertEqual(cart_response.status_code, 200)
+        self.assertEqual(cart_response.data["items"][0]["unavailable_reason"], "PRODUCT_BLOCKED")
+        self.assertFalse(cart_response.data["items"][0]["available"])
 
         second = self.client.post(
             "/api/v1/events/product",
