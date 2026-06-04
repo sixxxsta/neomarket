@@ -8,7 +8,7 @@ from .field_reports import normalize_field_reports
 from .models import BlockingReason, ModerationCard, ModerationEvent
 
 
-class SoftBlockError(Exception):
+class HardBlockError(Exception):
     def __init__(self, code, message, http_status):
         self.code = code
         self.message = message
@@ -19,47 +19,47 @@ class SoftBlockError(Exception):
 def _deliver_to_b2b(payload):
     result, error_kind = post_moderation_decision(payload)
     if error_kind == 'unconfigured':
-        raise SoftBlockError('B2B_NOT_CONFIGURED', 'B2B moderation endpoint is not configured', 503)
+        raise HardBlockError('B2B_NOT_CONFIGURED', 'B2B moderation endpoint is not configured', 503)
     if error_kind == 'unavailable':
-        raise SoftBlockError('B2B_UNAVAILABLE', 'B2B service is temporarily unavailable', 503)
+        raise HardBlockError('B2B_UNAVAILABLE', 'B2B service is temporarily unavailable', 503)
     http_status, _data = result
     if http_status == 404:
-        raise SoftBlockError('PRODUCT_NOT_FOUND', 'Product not found in B2B catalog', 404)
+        raise HardBlockError('PRODUCT_NOT_FOUND', 'Product not found in B2B catalog', 404)
     if http_status not in (200, 201):
-        raise SoftBlockError('B2B_UNAVAILABLE', 'B2B service rejected moderation decision', 503)
+        raise HardBlockError('B2B_UNAVAILABLE', 'B2B service rejected moderation decision', 503)
 
 
-def _resolve_blocking_reason(blocking_reason_id):
+def _resolve_hard_reason(blocking_reason_id):
     reason = BlockingReason.objects.filter(code=blocking_reason_id, is_active=True).first()
     if not reason:
-        raise SoftBlockError(
+        raise HardBlockError(
             'BLOCKING_REASON_NOT_FOUND',
             'Blocking reason does not exist',
             400,
         )
-    if reason.hard_only:
-        raise SoftBlockError(
-            'HARD_REASON_REQUIRES_HARD_BLOCK',
-            'This blocking reason requires hard block endpoint',
+    if not reason.hard_only:
+        raise HardBlockError(
+            'SOFT_REASON_REQUIRES_SOFT_BLOCK',
+            'This blocking reason requires soft decline without hard_block',
             400,
         )
     return reason
 
 
-def _validate_soft_block(card, moderator):
+def _validate_hard_block(card, moderator):
     if not card:
-        raise SoftBlockError('NOT_FOUND', 'Product is not in moderation review', 404)
+        raise HardBlockError('NOT_FOUND', 'Product is not in moderation review', 404)
 
     if card.assigned_to != moderator:
-        raise SoftBlockError(
-            'SOFT_BLOCK_NOT_ASSIGNED',
+        raise HardBlockError(
+            'HARD_BLOCK_NOT_ASSIGNED',
             'Card is assigned to another moderator',
             403,
         )
 
 
 def _build_b2b_payload(card, reason, comment, field_reports):
-    idempotency_key = f'soft-block:{card.id}'
+    idempotency_key = f'hard-block:{card.id}'
     blocking_reason = {
         'code': reason.code,
         'title': reason.title,
@@ -69,23 +69,23 @@ def _build_b2b_payload(card, reason, comment, field_reports):
         'idempotency_key': idempotency_key,
         'product_id': str(card.product_id),
         'status': 'BLOCKED',
-        'hard_block': False,
+        'hard_block': True,
         'blocking_reason': blocking_reason,
         'field_reports': field_reports,
     }, idempotency_key
 
 
 @transaction.atomic
-def soft_block_product(product_id, moderator, blocking_reason_id, comment='', field_reports=None):
+def hard_block_product(product_id, moderator, blocking_reason_id, comment='', field_reports=None):
     from .terminal import assert_product_not_hard_blocked
 
-    assert_product_not_hard_blocked(product_id, SoftBlockError)
+    assert_product_not_hard_blocked(product_id, HardBlockError)
 
-    reason = _resolve_blocking_reason(blocking_reason_id)
-    normalized_reports = normalize_field_reports(field_reports, error_cls=SoftBlockError)
+    reason = _resolve_hard_reason(blocking_reason_id)
+    normalized_reports = normalize_field_reports(field_reports, error_cls=HardBlockError)
 
     card = _get_in_review_card(product_id)
-    _validate_soft_block(card, moderator)
+    _validate_hard_block(card, moderator)
 
     decided_at = datetime.now(timezone.utc)
     b2b_payload, idempotency_key = _build_b2b_payload(card, reason, comment, normalized_reports)
@@ -101,7 +101,12 @@ def soft_block_product(product_id, moderator, blocking_reason_id, comment='', fi
 
     _deliver_to_b2b(b2b_payload)
 
-    card.queue_status = ModerationCard.QueueStatus.DECLINED
+    snapshot = dict(card.snapshot_after or {})
+    snapshot['status'] = 'HARD_BLOCKED'
+    snapshot['id'] = str(card.product_id)
+
+    card.queue_status = ModerationCard.QueueStatus.HARD_BLOCKED
+    card.snapshot_after = snapshot
     card.decline_reason = reason
     card.decline_comment = comment
     card.decline_fields = normalized_reports
@@ -112,6 +117,7 @@ def soft_block_product(product_id, moderator, blocking_reason_id, comment='', fi
     card.save(
         update_fields=[
             'queue_status',
+            'snapshot_after',
             'decline_reason',
             'decline_comment',
             'decline_fields',
@@ -131,7 +137,7 @@ def soft_block_product(product_id, moderator, blocking_reason_id, comment='', fi
             **b2b_payload,
             'moderated_at': decided_at.isoformat(),
             'moderator': moderator,
-            'result': 'BLOCKED',
+            'result': 'HARD_BLOCKED',
             'card_id': str(card.id),
         },
     )
@@ -142,8 +148,8 @@ def soft_block_product(product_id, moderator, blocking_reason_id, comment='', fi
 def _response_payload(product_id, reason, comment, field_reports):
     return {
         'product_id': str(product_id),
-        'status': 'BLOCKED',
-        'hard_block': False,
+        'status': 'HARD_BLOCKED',
+        'hard_block': True,
         'field_reports': field_reports,
         'reason': {
             'code': reason.code,

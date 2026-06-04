@@ -33,6 +33,7 @@ class ModerationCard(models.Model):
         IN_REVIEW = 'IN_REVIEW', 'IN_REVIEW'
         APPROVED = 'APPROVED', 'APPROVED'
         DECLINED = 'DECLINED', 'DECLINED'
+        HARD_BLOCKED = 'HARD_BLOCKED', 'HARD_BLOCKED'
         ARCHIVED = 'ARCHIVED', 'ARCHIVED'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -68,6 +69,9 @@ class ModerationCard(models.Model):
             models.Index(fields=['queue_status', 'created_at']),
             models.Index(fields=['product_id', 'queue_status']),
         ]
+
+
+TERMINAL_QUEUE_STATUSES = frozenset({ModerationCard.QueueStatus.HARD_BLOCKED})
 
 
 class ModerationEvent(models.Model):

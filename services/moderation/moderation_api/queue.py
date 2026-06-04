@@ -141,6 +141,12 @@ def enqueue_from_event(event: dict):
         _archive_cards(product_id)
         return None
 
+    if ModerationCard.objects.filter(
+        product_id=product_id,
+        queue_status=ModerationCard.QueueStatus.HARD_BLOCKED,
+    ).exists():
+        return None
+
     stored_event_type = _card_event_type(event_type)
     snapshot_after = event.get("snapshot_after") or fetch_b2b_snapshot(product_id) or {"id": str(product_id)}
     if not _requires_moderation(snapshot_after):

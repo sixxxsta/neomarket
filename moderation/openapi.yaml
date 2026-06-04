@@ -157,12 +157,13 @@ paths:
 
   /api/v1/products/{id}/decline:
     post:
-      summary: Мягкая блокировка (IN_REVIEW → BLOCKED)
+      summary: Блокировка товара (soft или hard по причине)
       description: |
-        Мягкая блокировка с замечаниями по полям. Синхронно отправляет в B2B
-        `status=BLOCKED`, `hard_block=false` и `field_reports`.
-        Идемпотентность: `idempotency_key` = `soft-block:{card_id}`.
-        Причины с `hard_only=true` отклоняются — нужен hard-block (US-MOD-05).
+        Единый endpoint decline. Маршрут по `blocking_reason_id.hard_only`:
+        - `hard_only=false` → мягкая блокировка (`BLOCKED`, `hard_block=false`, карточка `DECLINED`)
+        - `hard_only=true` → жёсткая терминальная (`HARD_BLOCKED`, `hard_block=true`)
+        Синхронная доставка в B2B. Идемпотентность: `soft-block:{card_id}` / `hard-block:{card_id}`.
+        Терминальная карточка `HARD_BLOCKED` не принимает approve/enqueue/повторный decline (403).
       tags: [Decisions]
       parameters:
         - name: id
@@ -270,7 +271,7 @@ components:
           enum: [CREATED, UPDATED, EDITED]
         queue_status:
           type: string
-          enum: [PENDING, IN_REVIEW, APPROVED, DECLINED, ARCHIVED]
+          enum: [PENDING, IN_REVIEW, APPROVED, DECLINED, HARD_BLOCKED, ARCHIVED]
         priority_queue:
           type: integer
           minimum: 1
@@ -362,7 +363,9 @@ components:
       properties:
         idempotency_key:
           type: string
-          example: "soft-block:6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+          examples:
+            soft: "soft-block:6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+            hard: "hard-block:6ba7b810-9dad-11d1-80b4-00c04fd430c8"
         product_id:
           type: string
           format: uuid
@@ -371,7 +374,7 @@ components:
           enum: [BLOCKED]
         hard_block:
           type: boolean
-          example: false
+          description: false — soft block; true — irreversible HARD_BLOCKED in B2B
         blocking_reason:
           type: object
         field_reports:
