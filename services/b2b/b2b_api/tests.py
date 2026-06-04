@@ -685,9 +685,9 @@ class B2BApiTests(TestCase):
         self.assertEqual(sku_short.active_quantity, 1)
         self.assertEqual(sku_short.reserved_quantity, 0)
 
-    def test_catalog_service_mode_returns_only_visible_products_without_sensitive_fields(self):
-        visible_product = self.create_product(status=Product.Status.MODERATED)
-        self.create_sku(visible_product, active_quantity=3, reserved_quantity=2, cost_price=450)
+    def _create_catalog_visibility_fixtures(self):
+        visible_product = self.create_product(status=Product.Status.MODERATED, title='Visible')
+        visible_sku = self.create_sku(visible_product, active_quantity=3, reserved_quantity=2, cost_price=450)
 
         blocked_product = self.create_product(title='Blocked', status=Product.Status.BLOCKED)
         self.create_sku(blocked_product, active_quantity=3)
@@ -701,24 +701,70 @@ class B2BApiTests(TestCase):
         no_stock_product = self.create_product(title='No stock', status=Product.Status.MODERATED)
         self.create_sku(no_stock_product, active_quantity=0)
 
-        unauthorized = self.client.get('/api/v1/products?limit=10&offset=0')
-        self.assertEqual(unauthorized.status_code, 401)
+        return {
+            'visible_product': visible_product,
+            'visible_sku': visible_sku,
+            'blocked_product': blocked_product,
+            'hard_blocked_product': hard_blocked_product,
+            'deleted_product': deleted_product,
+            'no_stock_product': no_stock_product,
+        }
+
+    def test_catalog_returns_moderated_in_stock_products(self):
+        fixtures = self._create_catalog_visibility_fixtures()
+
+        response = self.client.get('/api/v1/products?limit=50&offset=0', **self.service_headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['total'], 1)
+
+        item = response.data['items'][0]
+        self.assertEqual(item['id'], str(fixtures['visible_product'].id))
+        self.assertEqual(item['status'], Product.Status.MODERATED)
+        self.assertFalse(item.get('deleted', False))
+        self.assertEqual(len(item['skus']), 1)
+        self.assertGreater(item['skus'][0]['active_quantity'], 0)
+
+        returned_ids = {row['id'] for row in response.data['items']}
+        self.assertNotIn(str(fixtures['blocked_product'].id), returned_ids)
+        self.assertNotIn(str(fixtures['deleted_product'].id), returned_ids)
+        self.assertNotIn(str(fixtures['no_stock_product'].id), returned_ids)
+
+    def test_catalog_excludes_hard_blocked(self):
+        fixtures = self._create_catalog_visibility_fixtures()
+
+        response = self.client.get('/api/v1/products?limit=50&offset=0', **self.service_headers)
+        self.assertEqual(response.status_code, 200)
+        returned_ids = {row['id'] for row in response.data['items']}
+        self.assertNotIn(str(fixtures['hard_blocked_product'].id), returned_ids)
+
+    def test_catalog_missing_service_key_returns_401(self):
+        self._create_catalog_visibility_fixtures()
+
+        response = self.client.get('/api/v1/products?limit=10&offset=0')
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.data['code'], 'UNAUTHORIZED')
+
+    def test_catalog_response_has_no_cost_price(self):
+        fixtures = self._create_catalog_visibility_fixtures()
 
         response = self.client.get('/api/v1/products?limit=10&offset=0', **self.service_headers)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data['total'], 1)
-        returned = response.data['items'][0]
-        self.assertEqual(returned['id'], str(visible_product.id))
-        self.assertNotIn('cost_price', returned['skus'][0])
-        self.assertNotIn('reserved_quantity', returned['skus'][0])
+        sku_payload = response.data['items'][0]['skus'][0]
+        self.assertEqual(sku_payload['id'], str(fixtures['visible_sku'].id))
+        self.assertNotIn('cost_price', sku_payload)
+        self.assertNotIn('reserved_quantity', sku_payload)
 
-        ids_response = self.client.get(
-            f'/api/v1/products?ids={visible_product.id},{blocked_product.id},{deleted_product.id}',
+    def test_batch_ids_returns_visible_subset(self):
+        fixtures = self._create_catalog_visibility_fixtures()
+        visible = fixtures['visible_product']
+
+        response = self.client.get(
+            f'/api/v1/products?ids={visible.id},{fixtures["blocked_product"].id},{fixtures["deleted_product"].id}',
             **self.service_headers,
         )
-        self.assertEqual(ids_response.status_code, 200)
-        self.assertEqual(ids_response.data['total'], 1)
-        self.assertEqual(ids_response.data['items'][0]['id'], str(visible_product.id))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['total'], 1)
+        self.assertEqual(response.data['items'][0]['id'], str(visible.id))
 
     def _post_invoice(self, **extra):
         payload = {
