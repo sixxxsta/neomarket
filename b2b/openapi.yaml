@@ -236,7 +236,8 @@ paths:
   /api/v1/invoices:
     post:
       tags: [Invoices]
-      summary: Создать накладную
+      operationId: b2b_create_invoice
+      summary: Создать накладную (только SKU товаров в статусе MODERATED)
       requestBody:
         required: true
         content:
@@ -252,6 +253,12 @@ paths:
                 $ref: "#/components/schemas/Invoice"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Запрещено (SKU другого продавца)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/v1/invoices/accept:
     post:
@@ -1145,7 +1152,8 @@ components:
           format: uuid
         status:
           type: string
-          enum: [CREATED, ACCEPTED, REJECTED]
+          enum: [PENDING, CREATED, ACCEPTED, REJECTED]
+          description: PENDING — ожидает приёмки на складе; CREATED — legacy-алиас PENDING
         items:
           type: array
           items:
