@@ -812,39 +812,50 @@ class BannerEventsView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+def _serialize_collection_metadata(collection):
+    start_date = collection.start_date or collection.created_at.date()
+    return {
+        "id": str(collection.id),
+        "title": collection.title,
+        "description": collection.description,
+        "cover_image_url": collection.cover_image_url,
+        "target_url": collection.target_url,
+        "priority": collection.priority,
+        "start_date": start_date.isoformat(),
+    }
+
+
 @extend_schema_view(
-    get=extend_schema(operation_id="main_get_collections", responses=OpenApiTypes.OBJECT),
+    get=extend_schema(operation_id="getCollections", responses=OpenApiTypes.OBJECT),
 )
 class MainCollectionsView(APIView):
     def get(self, request):
-        limit = max(1, min(_parse_int(request.query_params.get("limit", 10), 10), 100))
+        limit = max(1, min(_parse_int(request.query_params.get("limit", 10), 10), 50))
         offset = max(0, _parse_int(request.query_params.get("offset", 0), 0))
         today = timezone.now().date()
-        queryset = Collection.objects.filter(is_active=True).filter(Q(start_date__isnull=True) | Q(start_date__lte=today)).order_by("priority", "-created_at")
+        queryset = (
+            Collection.objects.filter(is_active=True)
+            .filter(Q(start_date__isnull=True) | Q(start_date__lte=today))
+            .order_by("priority", "-created_at")
+        )
         total_count = queryset.count()
         collections = queryset[offset : offset + limit]
-        items = [
+        return Response(
             {
-                "id": str(collection.id),
-                "title": collection.title,
-                "description": collection.description,
-                "cover_image_url": collection.cover_image_url,
-                "target_url": collection.target_url,
-                "products_count": collection.collection_products.count(),
+                "metadata": {"total_count": total_count, "limit": limit, "offset": offset},
+                "collections": [_serialize_collection_metadata(collection) for collection in collections],
             }
-            for collection in collections
-        ]
-        return Response({"items": items, "total_count": total_count, "limit": limit, "offset": offset})
+        )
 
 
 @extend_schema_view(
-    get=extend_schema(operation_id="collections_get_products", responses=OpenApiTypes.OBJECT),
+    get=extend_schema(operation_id="getCollectionProducts", responses=OpenApiTypes.OBJECT),
 )
 class CollectionProductsView(APIView):
     def get(self, request, collection_id):
         collection = Collection.objects.filter(id=collection_id, is_active=True).first()
         if not collection:
-            return _error("Подборка не найдена", "NOT_FOUND", status.HTTP_404_NOT_FOUND)
+            return _error("Подборка не найдена", "COLLECTION_NOT_FOUND", status.HTTP_404_NOT_FOUND)
         limit = max(1, min(_parse_int(request.query_params.get("limit", 20), 20), 100))
         offset = max(0, _parse_int(request.query_params.get("offset", 0), 0))
         product_links = list(collection.collection_products.all().order_by("ordering", "product_id"))
@@ -858,17 +869,10 @@ class CollectionProductsView(APIView):
         unavailable_ids = [str(product_id) for product_id in paged_ids if str(product_id) not in products_by_id]
         return Response(
             {
-                "collection": {
-                    "id": str(collection.id),
-                    "title": collection.title,
-                    "description": collection.description,
-                    "cover_image_url": collection.cover_image_url,
-                },
+                "collection_title": collection.title,
+                "total_products": len(product_ids),
                 "items": items,
                 "unavailable_ids": unavailable_ids,
-                "total_count": len(product_ids),
-                "limit": limit,
-                "offset": offset,
             }
         )
 
