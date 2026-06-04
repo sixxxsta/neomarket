@@ -1,3 +1,4 @@
+import logging
 from uuid import UUID
 
 import jwt
@@ -15,6 +16,10 @@ from rest_framework.views import APIView
 from .models import IdempotencyKey, IntegrationOutbox, Order, OrderItem
 from .serializers import CancelOrderRequestSerializer, CreateOrderRequestSerializer, OrderListItemSerializer, OrderSerializer, UpdateOrderStatusRequestSerializer
 
+
+logger = logging.getLogger(__name__)
+
+CANCELABLE_STATUSES = {Order.Status.CREATED, Order.Status.PAID}
 
 ALLOWED_TRANSITIONS = {
     Order.Status.CREATED: {Order.Status.PAID, Order.Status.CANCELED},
@@ -431,7 +436,7 @@ class OrderDetailView(APIView):
 
 
 @extend_schema_view(
-    post=extend_schema(operation_id="orders_cancel", request=CancelOrderRequestSerializer, responses=OrderSerializer),
+    post=extend_schema(operation_id="cancelOrder", request=CancelOrderRequestSerializer, responses=OrderSerializer),
 )
 class OrderCancelView(APIView):
     @transaction.atomic
@@ -448,7 +453,7 @@ class OrderCancelView(APIView):
         if not order:
             return _error("ORDER_NOT_FOUND", "Заказ не найден", status.HTTP_404_NOT_FOUND)
 
-        if order.status not in {Order.Status.CREATED, Order.Status.PENDING, Order.Status.PAID, Order.Status.ASSEMBLING}:
+        if order.status not in CANCELABLE_STATUSES:
             current_status = "CANCELLED" if order.status == Order.Status.CANCELED else order.status
             return Response(
                 {
@@ -467,13 +472,30 @@ class OrderCancelView(APIView):
             },
         )
         if unreserve_error == "unavailable":
+            logger.warning(
+                "B2B unreserve unavailable for order %s; marked CANCEL_PENDING for async retry",
+                order.id,
+            )
             order.status = Order.Status.CANCEL_PENDING
         else:
             unreserve_status, _payload = result
-            order.status = Order.Status.CANCELED if unreserve_status == status.HTTP_200_OK else Order.Status.CANCEL_PENDING
+            if unreserve_status == status.HTTP_200_OK:
+                order.status = Order.Status.CANCELED
+            else:
+                logger.warning(
+                    "B2B unreserve returned %s for order %s; marked CANCEL_PENDING for async retry",
+                    unreserve_status,
+                    order.id,
+                )
+                order.status = Order.Status.CANCEL_PENDING
         order.cancel_reason = serializer.validated_data.get("reason") or order.cancel_reason
         order.save(update_fields=["status", "cancel_reason", "updated_at"])
-        _outbox_event(order.id, "ORDER_CANCELED", {"order_id": str(order.id), "reason": order.cancel_reason or ""})
+        event_type = "ORDER_CANCEL_PENDING" if order.status == Order.Status.CANCEL_PENDING else "ORDER_CANCELED"
+        _outbox_event(
+            order.id,
+            event_type,
+            {"order_id": str(order.id), "reason": order.cancel_reason or "", "status": order.status},
+        )
         return Response(OrderSerializer(order).data)
 
 
