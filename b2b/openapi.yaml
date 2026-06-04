@@ -33,7 +33,9 @@ paths:
       summary: Список товаров (JWT продавца) или каталог B2C (X-Service-Key)
       description: |
         Два режима одного endpoint по заголовкам:
-        - **Bearer JWT** — кабинет продавца: все свои товары, фильтры status/search/category_id.
+        - **Bearer JWT** — кабинет продавца: только товары с `seller_id` из JWT (параметр `seller_id`
+          в query игнорируется — защита от IDOR), включая удалённые с `deleted=true`; в каждом item
+          `skus_count` и `total_active_quantity`; фильтры status/search/category_id.
         - **X-Service-Key** (без Bearer) — каталог для B2C: только MODERATED, deleted=false,
           SKU с active_quantity>0; без cost_price и reserved_quantity. Параметр `ids` — batch,
           возвращает только видимые id (скрытые не дают 404).

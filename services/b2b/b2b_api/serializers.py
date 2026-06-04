@@ -118,6 +118,8 @@ class ProductSerializer(serializers.ModelSerializer):
     blocking_reason_id = serializers.SerializerMethodField()
     moderator_comment = serializers.SerializerMethodField()
     skus = serializers.SerializerMethodField()
+    skus_count = serializers.IntegerField(read_only=True, required=False)
+    total_active_quantity = serializers.IntegerField(read_only=True, required=False)
 
     class Meta:
         model = Product
@@ -137,6 +139,8 @@ class ProductSerializer(serializers.ModelSerializer):
             'images',
             'characteristics',
             'skus',
+            'skus_count',
+            'total_active_quantity',
             'created_at',
             'updated_at',
         ]
@@ -157,6 +161,10 @@ class ProductSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         data = super().to_representation(instance)
         data['images'] = _normalize_product_images(instance.images)
+        if data.get('skus_count') is None:
+            data['skus_count'] = 0
+        if data.get('total_active_quantity') is None:
+            data['total_active_quantity'] = 0
         return data
 
 

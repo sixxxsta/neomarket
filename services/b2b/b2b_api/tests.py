@@ -499,8 +499,9 @@ class B2BApiTests(TestCase):
 
         listed = self.client.get('/api/v1/products?limit=10&offset=0', **self.headers)
         self.assertEqual(listed.status_code, 200)
-        self.assertEqual(listed.data['total'], 0)
-        self.assertEqual(listed.data['items'], [])
+        deleted_item = next((item for item in listed.data['items'] if item['id'] == str(product.id)), None)
+        self.assertIsNotNone(deleted_item)
+        self.assertTrue(deleted_item['deleted'])
 
         second_delete = self.client.delete(f'/api/v1/products/{product.id}', **self.headers)
         self.assertEqual(second_delete.status_code, 400)
@@ -1015,27 +1016,77 @@ class B2BApiTests(TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.data['code'], 'FORBIDDEN')
 
-    def test_seller_list_ignores_query_seller_id_and_supports_status_filter(self):
+    def _get_seller_products(self, **query):
+        params = 'limit=50&offset=0'
+        for key, value in query.items():
+            params += f'&{key}={value}'
+        return self.client.get(f'/api/v1/products?{params}', **self.headers)
+
+    def test_list_returns_only_own_products(self):
+        own = self.create_product(title='Own product', status=Product.Status.MODERATED)
+        self.create_sku(own, active_quantity=3)
+        foreign = self.create_product(
+            seller_id=self.other_seller_id,
+            title='Foreign product',
+            status=Product.Status.MODERATED,
+        )
+        self.create_sku(foreign, active_quantity=5)
+
+        response = self._get_seller_products()
+        self.assertEqual(response.status_code, 200)
+        returned_ids = {item['id'] for item in response.data['items']}
+        self.assertIn(str(own.id), returned_ids)
+        self.assertNotIn(str(foreign.id), returned_ids)
+
+        own_item = next(item for item in response.data['items'] if item['id'] == str(own.id))
+        self.assertEqual(own_item['skus_count'], 1)
+        self.assertEqual(own_item['total_active_quantity'], 3)
+
+    def test_idor_query_param_seller_id_ignored(self):
         own_blocked = self.create_product(title='Own blocked', status=Product.Status.BLOCKED)
-        self.create_product(title='Own created', status=Product.Status.CREATED)
         self.create_product(seller_id=self.other_seller_id, title='Foreign blocked', status=Product.Status.BLOCKED)
 
-        response = self.client.get(
-            f'/api/v1/products?limit=10&offset=0&seller_id={self.other_seller_id}&status=BLOCKED&search=blocked',
-            **self.headers,
+        response = self._get_seller_products(
+            seller_id=str(self.other_seller_id),
+            status='BLOCKED',
+            search='blocked',
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['total'], 1)
         self.assertEqual(response.data['items'][0]['id'], str(own_blocked.id))
 
-    def test_seller_list_search_is_case_insensitive_and_excludes_deleted_items(self):
-        deleted_product = self.create_product(title='Neo CAMERA', status=Product.Status.MODERATED, deleted=True)
-        self.create_product(title='Something else', status=Product.Status.MODERATED)
+    def test_deleted_products_visible_with_deleted_flag(self):
+        active = self.create_product(title='Active item', status=Product.Status.MODERATED)
+        self.create_sku(active)
+        deleted = self.create_product(title='Removed item', status=Product.Status.MODERATED)
+        self.create_sku(deleted, active_quantity=2)
+        self.assertEqual(self.client.delete(f'/api/v1/products/{deleted.id}', **self.headers).status_code, 204)
 
-        response = self.client.get('/api/v1/products?limit=10&offset=0&search=camera', **self.headers)
+        response = self._get_seller_products()
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data['total'], 0)
-        self.assertEqual(response.data['items'], [])
+        by_id = {item['id']: item for item in response.data['items']}
+        self.assertFalse(by_id[str(active.id)]['deleted'])
+        self.assertTrue(by_id[str(deleted.id)]['deleted'])
+
+    def test_status_filter_works_correctly(self):
+        blocked = self.create_product(title='Blocked only', status=Product.Status.BLOCKED)
+        self.create_product(title='Created other', status=Product.Status.CREATED)
+
+        response = self._get_seller_products(status='BLOCKED')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['total'], 1)
+        self.assertEqual(response.data['items'][0]['id'], str(blocked.id))
+        self.assertEqual(response.data['items'][0]['status'], Product.Status.BLOCKED)
+
+    def test_search_by_title_case_insensitive(self):
+        neo = self.create_product(title='Neo CAMERA pro', status=Product.Status.MODERATED)
+        deleted_match = self.create_product(title='camera lens kit', status=Product.Status.MODERATED, deleted=True)
+        self.create_product(title='Unrelated phone', status=Product.Status.MODERATED)
+
+        response = self._get_seller_products(search='CaMeRa')
+        self.assertEqual(response.status_code, 200)
+        returned_ids = {item['id'] for item in response.data['items']}
+        self.assertEqual(returned_ids, {str(neo.id), str(deleted_match.id)})
 
     def test_delete_sets_deleted_true(self):
         product = self.create_product(status=Product.Status.MODERATED)
@@ -1088,16 +1139,6 @@ class B2BApiTests(TestCase):
         response = self.client.delete(f'/api/v1/products/{product.id}', **self.headers)
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data['code'], 'BAD_REQUEST')
-
-    def test_deleted_product_not_in_seller_list(self):
-        product = self.create_product(status=Product.Status.MODERATED)
-        self.create_sku(product, active_quantity=4)
-        self.assertEqual(self.client.delete(f'/api/v1/products/{product.id}', **self.headers).status_code, 204)
-
-        list_response = self.client.get('/api/v1/products?limit=10&offset=0', **self.headers)
-        self.assertEqual(list_response.status_code, 200)
-        returned_ids = {item['id'] for item in list_response.data['items']}
-        self.assertNotIn(str(product.id), returned_ids)
 
     def test_delete_others_product_returns_403(self):
         foreign_product = self.create_product(seller_id=self.other_seller_id, status=Product.Status.MODERATED)
