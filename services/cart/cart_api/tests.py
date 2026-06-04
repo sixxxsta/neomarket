@@ -5,9 +5,20 @@ from unittest.mock import Mock, patch
 import jwt
 from django.conf import settings
 from django.test import TestCase
+from django.utils import timezone as django_timezone
 from rest_framework.test import APIClient
 
-from cart_api.models import Banner, Cart, CartItem, Collection, CollectionProduct, Favorite, ProductEventInbox, Subscription
+from cart_api.models import (
+    Banner,
+    BannerEvent,
+    Cart,
+    CartItem,
+    Collection,
+    CollectionProduct,
+    Favorite,
+    ProductEventInbox,
+    Subscription,
+)
 
 
 def _jwt_for_user(user_id):
@@ -307,6 +318,96 @@ class CartApiTests(TestCase):
         )
         self.assertEqual(second.status_code, 204)
 
+    def test_active_banners_returned_sorted_by_priority(self):
+        now = django_timezone.now()
+        first = Banner.objects.create(
+            title="Sale",
+            image_url="/sale.jpg",
+            link="/sale",
+            priority=10,
+            is_active=True,
+            placement=Banner.Placement.HOME,
+        )
+        second = Banner.objects.create(
+            title="New",
+            image_url="/new.jpg",
+            link="/new",
+            priority=20,
+            is_active=True,
+            placement=Banner.Placement.HOME,
+        )
+        Banner.objects.create(
+            title="Inactive",
+            image_url="/off.jpg",
+            link="/off",
+            priority=5,
+            is_active=False,
+            placement=Banner.Placement.HOME,
+        )
+        Banner.objects.create(
+            title="Expired",
+            image_url="/exp.jpg",
+            link="/exp",
+            priority=15,
+            is_active=True,
+            placement=Banner.Placement.HOME,
+            end_at=now - timedelta(hours=1),
+        )
+        Banner.objects.create(
+            title="Future",
+            image_url="/fut.jpg",
+            link="/fut",
+            priority=8,
+            is_active=True,
+            placement=Banner.Placement.HOME,
+            start_at=now + timedelta(hours=1),
+        )
+        Banner.objects.create(
+            title="Other placement",
+            image_url="/cat.jpg",
+            link="/cat",
+            priority=1,
+            is_active=True,
+            placement="catalog",
+        )
+
+        response = self.client.get("/api/v1/home/banners")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["total_count"], 2)
+        self.assertEqual([item["id"] for item in response.data["items"]], [str(first.id), str(second.id)])
+        self.assertEqual([item["priority"] for item in response.data["items"]], [10, 20])
+
+    def test_no_active_banners_returns_200_empty(self):
+        Banner.objects.create(
+            title="Inactive only",
+            image_url="/off.jpg",
+            link="/off",
+            is_active=False,
+            placement=Banner.Placement.HOME,
+        )
+
+        response = self.client.get("/api/v1/home/banners")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["items"], [])
+        self.assertEqual(response.data["total_count"], 0)
+
+    def test_click_on_unknown_banner_returns_400(self):
+        response = self.client.post(
+            "/api/v1/banner-events",
+            {
+                "events": [
+                    {
+                        "banner_id": str(uuid.uuid4()),
+                        "event": "click",
+                        "timestamp": "2026-05-11T19:00:05Z",
+                    }
+                ]
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["code"], "BANNER_NOT_FOUND")
+
     def test_banner_events_accept_batch(self):
         banner_a = Banner.objects.create(title="A", image_url="/a.jpg", link="/a", priority=1)
         banner_b = Banner.objects.create(title="B", image_url="/b.jpg", link="/b", priority=2)
@@ -330,6 +431,7 @@ class CartApiTests(TestCase):
             HTTP_AUTHORIZATION=self.auth,
         )
         self.assertEqual(response.status_code, 204)
+        self.assertEqual(BannerEvent.objects.count(), 2)
 
     @patch("cart_api.views.requests.get")
     def test_collection_products_returns_unavailable_ids(self, mock_get):

@@ -83,10 +83,19 @@ class BannerEvent(models.Model):
 
 
 class Banner(models.Model):
+    class Placement(models.TextChoices):
+        HOME = "home", "home"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     title = models.CharField(max_length=255)
     image_url = models.CharField(max_length=500)
     link = models.CharField(max_length=500)
+    placement = models.CharField(
+        max_length=32,
+        choices=Placement.choices,
+        default=Placement.HOME,
+        db_index=True,
+    )
     priority = models.IntegerField(default=0, db_index=True)
     is_active = models.BooleanField(default=True, db_index=True)
     start_at = models.DateTimeField(null=True, blank=True)
