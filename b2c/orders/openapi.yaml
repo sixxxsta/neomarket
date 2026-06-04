@@ -126,6 +126,13 @@ paths:
     patch:
       tags: [Order Status]
       summary: Обновить статус заказа (внутренний API/админка)
+      description: |
+        При переходе в `DELIVERED` orders-сервис синхронно вызывает B2B
+        `POST /api/v1/inventory/fulfill` с `order_id` и позициями заказа.
+        Идемпотентность на стороне B2B по `order_id`.
+
+        При ошибке fulfill заказ остаётся `DELIVERED`; в outbox пишется
+        `ORDER_FULFILL_PENDING` для асинхронного ретрая (`retry_pending_fulfill`).
       parameters:
         - $ref: "#/components/parameters/OrderId"
       requestBody:
@@ -349,6 +356,27 @@ components:
       properties:
         accepted:
           type: boolean
+
+    InventoryFulfillRequest:
+      type: object
+      required: [order_id, items]
+      properties:
+        order_id:
+          type: string
+          description: UUID заказа (ключ идемпотентности в B2B)
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [sku_id, quantity]
+            properties:
+              sku_id:
+                type: string
+                format: uuid
+              quantity:
+                type: integer
+                minimum: 1
 
     CancelOrderRequest:
       type: object

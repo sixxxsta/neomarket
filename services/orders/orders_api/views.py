@@ -13,6 +13,8 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .fulfill import trigger_fulfill_on_delivered
+from .inventory_client import inventory_call as _inventory_call
 from .models import IdempotencyKey, IntegrationOutbox, Order, OrderItem
 from .serializers import CancelOrderRequestSerializer, CreateOrderRequestSerializer, OrderListItemSerializer, OrderSerializer, UpdateOrderStatusRequestSerializer
 
@@ -127,23 +129,6 @@ def _catalog_products_by_sku_ids(sku_ids):
     except ValueError:
         return None, _error("B2B_UNAVAILABLE", "Сервис товаров временно недоступен, попробуйте позже", status.HTTP_503_SERVICE_UNAVAILABLE)
     return payload.get("items", []), None
-
-
-def _inventory_call(url, payload):
-    try:
-        response = requests.post(
-            url,
-            json=payload,
-            headers={"X-Service-Key": settings.INTERNAL_SERVICE_KEY},
-            timeout=settings.B2B_TIMEOUT,
-        )
-    except requests.RequestException:
-        return None, "unavailable"
-    try:
-        data = response.json()
-    except ValueError:
-        data = {}
-    return (response.status_code, data), None
 
 
 def _normalize_promo_code(raw):
@@ -529,12 +514,7 @@ class OrderStatusView(APIView):
         order.save(update_fields=["status", "cancel_reason", "updated_at"])
 
         if new_status == Order.Status.DELIVERED:
-            result, fulfill_error = _inventory_call(
-                settings.B2B_FULFILL_URL,
-                {"order_id": str(order.id), "items": [{"sku_id": str(item.sku_id), "quantity": item.quantity} for item in order.items.all()]},
-            )
-            if fulfill_error == "unavailable" or result[0] != status.HTTP_200_OK:
-                _outbox_event(order.id, "ORDER_FULFILL_PENDING", {"order_id": str(order.id)})
+            trigger_fulfill_on_delivered(order)
 
         _outbox_event(order.id, "ORDER_STATUS_UPDATED", {"order_id": str(order.id), "status": order.status})
         return Response(OrderSerializer(order).data)

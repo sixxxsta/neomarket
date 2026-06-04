@@ -5,10 +5,12 @@ from unittest.mock import Mock, patch
 import jwt
 import requests
 from django.conf import settings
+from django.core.management import call_command
 from django.test import TestCase
 from rest_framework.test import APIClient
 
-from orders_api.models import Order, OrderItem
+from orders_api.fulfill import attempt_fulfill
+from orders_api.models import IntegrationOutbox, Order, OrderItem
 
 
 def _jwt_for_user(user_id, is_admin=False):
@@ -69,7 +71,7 @@ class OrdersApiTests(TestCase):
         return response
 
     @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
+    @patch("orders_api.inventory_client.requests.post")
     def test_checkout_creates_paid_order_with_fixed_prices(self, mock_post, mock_get):
         mock_get.return_value = self._catalog_response()
         mock_post.return_value = self._inventory_response(
@@ -96,7 +98,7 @@ class OrdersApiTests(TestCase):
         self.assertEqual(order_item.sku_name, "Black 256GB")
 
     @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
+    @patch("orders_api.inventory_client.requests.post")
     def test_partial_reserve_failure_returns_409(self, mock_post, mock_get):
         mock_get.return_value = self._catalog_response()
         failed = Mock()
@@ -127,7 +129,7 @@ class OrdersApiTests(TestCase):
         self.assertEqual(Order.objects.count(), 0)
 
     @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
+    @patch("orders_api.inventory_client.requests.post")
     def test_idempotency_returns_existing_order(self, mock_post, mock_get):
         mock_get.return_value = self._catalog_response()
         mock_post.return_value = self._inventory_response(
@@ -157,7 +159,7 @@ class OrdersApiTests(TestCase):
         self.assertEqual(mock_post.call_count, 1)
 
     @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
+    @patch("orders_api.inventory_client.requests.post")
     def test_b2b_unavailable_returns_503(self, mock_post, mock_get):
         mock_get.side_effect = requests.RequestException("connection refused")
 
@@ -173,7 +175,7 @@ class OrdersApiTests(TestCase):
         mock_post.assert_not_called()
 
     @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
+    @patch("orders_api.inventory_client.requests.post")
     def test_invalid_status_transition_returns_409(self, mock_post, mock_get):
         mock_get.return_value = self._catalog_response()
         mock_post.return_value = self._inventory_response({"reserved": True, "items": [{"sku_id": str(self.sku_id), "reserved_quantity": 1}]})
@@ -191,7 +193,7 @@ class OrdersApiTests(TestCase):
         self.assertEqual(patch_response.status_code, 409)
 
     @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
+    @patch("orders_api.inventory_client.requests.post")
     def test_cancel_paid_order_transitions_to_cancelled(self, mock_post, mock_get):
         mock_get.return_value = self._catalog_response()
         mock_post.side_effect = [
@@ -207,7 +209,7 @@ class OrdersApiTests(TestCase):
         self.assertEqual(Order.objects.get(id=order_id).status, Order.Status.CANCELED)
 
     @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
+    @patch("orders_api.inventory_client.requests.post")
     def test_unreserve_failure_transitions_to_cancel_pending(self, mock_post, mock_get):
         mock_get.return_value = self._catalog_response()
         mock_post.side_effect = [
@@ -223,7 +225,7 @@ class OrdersApiTests(TestCase):
         self.assertEqual(Order.objects.get(id=order_id).status, Order.Status.CANCEL_PENDING)
 
     @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
+    @patch("orders_api.inventory_client.requests.post")
     def test_cancel_assembling_order_returns_409(self, mock_post, mock_get):
         created = self._create_order(mock_post, mock_get)
         order_id = created.data["id"]
@@ -238,7 +240,7 @@ class OrdersApiTests(TestCase):
         self.assertEqual(Order.objects.get(id=order_id).status, Order.Status.ASSEMBLING)
 
     @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
+    @patch("orders_api.inventory_client.requests.post")
     def test_other_user_order_returns_404(self, mock_post, mock_get):
         created = self._create_order(mock_post, mock_get)
         order_id = created.data["id"]
@@ -249,36 +251,109 @@ class OrdersApiTests(TestCase):
         self.assertEqual(response.data["code"], "ORDER_NOT_FOUND")
         self.assertNotEqual(response.status_code, 403)
 
-    @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
-    def test_delivered_status_triggers_fulfill_call(self, mock_post, mock_get):
-        mock_get.return_value = self._catalog_response()
-        mock_post.side_effect = [
-            self._inventory_response({"reserved": True, "items": [{"sku_id": str(self.sku_id), "reserved_quantity": 1}]}),
-            self._inventory_response({"fulfilled": True}),
-        ]
-        created = self.client.post("/api/v1/orders", self._order_payload(), format="json", HTTP_AUTHORIZATION=self.auth)
-        order_id = created.data["id"]
+    def _transition_to_delivered(self, order_id):
         order = Order.objects.get(id=order_id)
         order.status = Order.Status.ASSEMBLING
         order.save(update_fields=["status"])
-
-        delivering = self.client.patch(
+        self.client.patch(
             f"/api/v1/orders/{order_id}/status",
             {"status": "DELIVERING"},
             format="json",
             HTTP_AUTHORIZATION=self.admin_auth,
         )
-        self.assertEqual(delivering.status_code, 200)
-
-        delivered = self.client.patch(
+        return self.client.patch(
             f"/api/v1/orders/{order_id}/status",
             {"status": "DELIVERED"},
             format="json",
             HTTP_AUTHORIZATION=self.admin_auth,
         )
+
+    @patch("orders_api.views.requests.get")
+    @patch("orders_api.inventory_client.requests.post")
+    def test_delivered_status_triggers_fulfill_to_b2b(self, mock_post, mock_get):
+        mock_get.return_value = self._catalog_response()
+        mock_post.side_effect = [
+            self._inventory_response({"reserved": True, "items": [{"sku_id": str(self.sku_id), "reserved_quantity": 1}]}),
+            self._inventory_response({"fulfilled": True, "items": [{"sku_id": str(self.sku_id), "reserved_quantity": 0}]}),
+        ]
+        created = self.client.post("/api/v1/orders", self._order_payload(), format="json", HTTP_AUTHORIZATION=self.auth)
+        order_id = created.data["id"]
+
+        delivered = self._transition_to_delivered(order_id)
         self.assertEqual(delivered.status_code, 200)
         self.assertEqual(delivered.data["status"], "DELIVERED")
+
+        fulfill_call = mock_post.call_args_list[-1]
+        self.assertEqual(fulfill_call.args[0], settings.B2B_FULFILL_URL)
+        self.assertEqual(fulfill_call.kwargs["json"]["order_id"], order_id)
+        self.assertEqual(
+            fulfill_call.kwargs["json"]["items"],
+            [{"sku_id": str(self.sku_id), "quantity": 1}],
+        )
+        order = Order.objects.get(id=order_id)
+        self.assertIsNotNone(order.fulfilled_at)
+
+    @patch("orders_api.views.requests.get")
+    @patch("orders_api.inventory_client.requests.post")
+    def test_fulfill_failure_retried_asynchronously(self, mock_post, mock_get):
+        mock_get.return_value = self._catalog_response()
+        mock_post.side_effect = [
+            self._inventory_response({"reserved": True, "items": [{"sku_id": str(self.sku_id), "reserved_quantity": 1}]}),
+            requests.RequestException("connection refused"),
+        ]
+        created = self.client.post("/api/v1/orders", self._order_payload(), format="json", HTTP_AUTHORIZATION=self.auth)
+        order_id = created.data["id"]
+
+        delivered = self._transition_to_delivered(order_id)
+        self.assertEqual(delivered.status_code, 200)
+        self.assertEqual(Order.objects.get(id=order_id).status, Order.Status.DELIVERED)
+        self.assertTrue(
+            IntegrationOutbox.objects.filter(
+                aggregate_id=order_id,
+                event_type="ORDER_FULFILL_PENDING",
+                published=False,
+            ).exists()
+        )
+
+        mock_post.side_effect = [
+            self._inventory_response({"fulfilled": True, "items": [{"sku_id": str(self.sku_id), "reserved_quantity": 0}]}),
+        ]
+        call_command("retry_pending_fulfill")
+        order = Order.objects.get(id=order_id)
+        self.assertIsNotNone(order.fulfilled_at)
+        self.assertFalse(
+            IntegrationOutbox.objects.filter(
+                aggregate_id=order_id,
+                event_type="ORDER_FULFILL_PENDING",
+                published=False,
+            ).exists()
+        )
+
+    @patch("orders_api.inventory_client.requests.post")
+    def test_repeated_fulfill_idempotent(self, mock_post):
+        mock_post.return_value = self._inventory_response(
+            {"fulfilled": True, "items": [{"sku_id": str(self.sku_id), "reserved_quantity": 0}]}
+        )
+        order = Order.objects.create(
+            user_id=self.user_id,
+            status=Order.Status.DELIVERED,
+            total_amount=12999000,
+            payment_method=Order.PaymentMethod.CARD_ONLINE,
+            delivery_address={"city": "Ekb"},
+        )
+        OrderItem.objects.create(
+            order=order,
+            product_id=self.product_id,
+            sku_id=self.sku_id,
+            quantity=1,
+            unit_price_amount=12999000,
+            line_total_amount=12999000,
+        )
+
+        self.assertTrue(attempt_fulfill(order)[0])
+        order.refresh_from_db()
+        self.assertTrue(attempt_fulfill(order)[0])
+        self.assertEqual(mock_post.call_count, 1)
 
     def _create_order(self, mock_post, mock_get, user_auth=None):
         mock_get.return_value = self._catalog_response()
@@ -295,7 +370,7 @@ class OrdersApiTests(TestCase):
         )
 
     @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
+    @patch("orders_api.inventory_client.requests.post")
     def test_orders_list_returns_own_orders_paginated(self, mock_post, mock_get):
         self.assertEqual(self._create_order(mock_post, mock_get).status_code, 201)
         self.assertEqual(self._create_order(mock_post, mock_get).status_code, 201)
@@ -327,7 +402,7 @@ class OrdersApiTests(TestCase):
         self.assertEqual(spoofed.data["total_count"], 2)
 
     @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
+    @patch("orders_api.inventory_client.requests.post")
     def test_order_detail_shows_fixed_prices(self, mock_post, mock_get):
         created = self._create_order(mock_post, mock_get)
         order_id = created.data["id"]
@@ -345,7 +420,7 @@ class OrdersApiTests(TestCase):
         self.assertEqual(order_item.unit_price_amount, 12999000)
 
     @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
+    @patch("orders_api.inventory_client.requests.post")
     def test_other_user_order_detail_returns_404_not_403(self, mock_post, mock_get):
         created = self._create_order(mock_post, mock_get)
         order_id = created.data["id"]
@@ -357,7 +432,7 @@ class OrdersApiTests(TestCase):
         self.assertNotEqual(response.status_code, 403)
 
     @patch("orders_api.views.requests.get")
-    @patch("orders_api.views.requests.post")
+    @patch("orders_api.inventory_client.requests.post")
     def test_orders_not_affected_by_product_blocked(self, mock_post, mock_get):
         """US-ORD-04: PRODUCT_BLOCKED is handled in cart_db; checkout snapshot in orders_db is immutable."""
         created = self._create_order(mock_post, mock_get)
