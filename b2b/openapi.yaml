@@ -312,7 +312,14 @@ paths:
   /api/v1/reserve:
     post:
       tags: [SKU]
-      summary: Зарезервировать остатки по SKU
+      operationId: b2b_reserve_inventory
+      summary: Зарезервировать остатки по SKU (all-or-nothing, идемпотентно)
+      description: |
+        Межсервисный вызов B2C→B2B (`X-Service-Key`). All-or-nothing: при нехватке любого SKU — 409,
+        ни один SKU не резервируется. Повтор с тем же `idempotency_key` — 200 без повторного списания.
+        При `active_quantity=0` после резерва — событие `SKU_OUT_OF_STOCK` в outbox для B2C.
+      security:
+        - ServiceKeyAuth: []
       requestBody:
         required: true
         content:
@@ -321,16 +328,31 @@ paths:
               $ref: "#/components/schemas/InventoryOperationRequest"
       responses:
         "200":
-          description: Резерв создан
+          description: Резерв создан (или идемпотентный повтор)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/InventoryOperationResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Недостаточно остатков (транзакция откатилась целиком)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/v1/unreserve:
     post:
       tags: [SKU]
-      summary: Снять резерв по SKU
+      operationId: b2b_unreserve_inventory
+      summary: Снять резерв по SKU (компенсирующая операция, идемпотентно)
+      description: |
+        Возвращает quantity из reserved_quantity в active_quantity. Идемпотентность по `idempotency_key`.
+      security:
+        - ServiceKeyAuth: []
       requestBody:
         required: true
         content:
@@ -339,11 +361,21 @@ paths:
               $ref: "#/components/schemas/InventoryOperationRequest"
       responses:
         "200":
-          description: Резерв снят
+          description: Резерв снят (или идемпотентный повтор)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/InventoryOperationResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Снять больше, чем зарезервировано
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /api/v1/fulfill:
     post:
@@ -1194,6 +1226,8 @@ components:
       properties:
         idempotency_key:
           type: string
+          format: uuid
+          description: Ключ идемпотентности (генерирует B2C-клиент)
         items:
           type: array
           minItems: 1
