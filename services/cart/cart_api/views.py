@@ -656,19 +656,11 @@ class FavoritesView(APIView):
 
 
 @extend_schema_view(
-    post=extend_schema(operation_id="favorites_add", responses=FavoriteMutationSerializer),
+    put=extend_schema(operation_id="favorites_add", responses=None),
     delete=extend_schema(operation_id="favorites_delete", responses=None),
 )
 class FavoriteDetailView(APIView):
-    serializer_class = FavoriteMutationSerializer
-
     def put(self, request, product_id):
-        return self._add(request, product_id)
-
-    def post(self, request, product_id):
-        return self._add(request, product_id)
-
-    def _add(self, request, product_id):
         user_id, error = _get_user_id_for_favorites(request)
         if error:
             return error
@@ -683,16 +675,8 @@ class FavoriteDetailView(APIView):
         if not products:
             return _error("Товар не найден", "PRODUCT_NOT_FOUND", status.HTTP_404_NOT_FOUND)
 
-        favorite, created = Favorite.objects.get_or_create(user_id=user_id, product_id=product_uuid)
-        if created:
-            return Response(
-                _favorite_mutation_payload(favorite, "Товар добавлен в избранное"),
-                status=status.HTTP_201_CREATED,
-            )
-        return Response(
-            _favorite_mutation_payload(favorite, "Товар уже находится в избранном"),
-            status=status.HTTP_200_OK,
-        )
+        Favorite.objects.get_or_create(user_id=user_id, product_id=product_uuid)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     def delete(self, request, product_id):
         user_id, error = _get_user_id_for_favorites(request)
@@ -728,7 +712,7 @@ class FavoriteSubscribeView(APIView):
 
         serializer = SubscribeRequestSerializer(data=request.data or {})
         if not serializer.is_valid():
-            return _error("Должен быть указан хотя бы один тип уведомления", "INVALID_NOTIFY_ON", status.HTTP_400_BAD_REQUEST)
+            return _error("Должен быть указан хотя бы один тип уведомления", "INVALID_EVENTS", status.HTTP_400_BAD_REQUEST)
 
         products, catalog_error = _catalog_products_by_ids([product_uuid])
         if catalog_error:
@@ -736,22 +720,19 @@ class FavoriteSubscribeView(APIView):
         if not products:
             return _error("Товар не найден", "PRODUCT_NOT_FOUND", status.HTTP_404_NOT_FOUND)
 
-        if Subscription.objects.filter(user_id=user_id, product_id=product_uuid).exists():
+        events = serializer.validated_data["events"]
+        subscription, created = Subscription.objects.get_or_create(
+            user_id=user_id,
+            product_id=product_uuid,
+            defaults={"notify_on": events},
+        )
+        if not created:
             return _error(
                 "Вы уже подписаны на уведомления об этом товаре",
                 "SUBSCRIPTION_ALREADY_EXISTS",
                 status.HTTP_409_CONFLICT,
             )
-
-        subscription = Subscription.objects.create(
-            user_id=user_id,
-            product_id=product_uuid,
-            notify_on=serializer.validated_data["notify_on"],
-        )
-        return Response(
-            _serialize_subscription_response(subscription, products[0]),
-            status=status.HTTP_201_CREATED,
-        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     def delete(self, request, product_id):
         user_id, error = _get_user_id_for_favorites(request)

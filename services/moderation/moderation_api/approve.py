@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 from django.db import transaction
 from .b2b_client import post_moderation_decision
+from .b2b_payload import build_approve_payload
 from .models import ModerationCard, ModerationEvent
 from .queue import _has_live_skus
 
@@ -22,18 +23,6 @@ def _edited_during_review(card):
     if not card.review_started_at:
         return False
     return card.updated_at > card.review_started_at
-
-
-def _build_b2b_payload(card, moderator, decided_at):
-    idempotency_key = f'approve:{card.id}'
-    return {
-        'idempotency_key': idempotency_key,
-        'product_id': str(card.product_id),
-        'status': 'MODERATED',
-        'hard_block': False,
-        'blocking_reason': None,
-        'field_reports': [],
-    }, idempotency_key
 
 
 def _deliver_to_b2b(payload):
@@ -106,7 +95,7 @@ def approve_product(product_id, moderator):
     _validate_approve(card, moderator)
 
     decided_at = datetime.now(timezone.utc)
-    b2b_payload, idempotency_key = _build_b2b_payload(card, moderator, decided_at)
+    b2b_payload, idempotency_key = build_approve_payload(card, decided_at)
 
     existing_event = ModerationEvent.objects.filter(
         product_id=product_id,

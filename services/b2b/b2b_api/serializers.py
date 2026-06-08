@@ -273,21 +273,36 @@ class InventoryRequestItemSerializer(serializers.Serializer):
 
 class ReserveRequestSerializer(serializers.Serializer):
     idempotency_key = serializers.CharField(max_length=128)
+    order_id = serializers.UUIDField()
+    items = InventoryRequestItemSerializer(many=True, allow_empty=False)
+
+
+class UnreserveRequestSerializer(serializers.Serializer):
+    order_id = serializers.UUIDField()
     items = InventoryRequestItemSerializer(many=True, allow_empty=False)
 
 
 class FulfillRequestSerializer(serializers.Serializer):
-    order_id = serializers.CharField(max_length=128)
+    order_id = serializers.UUIDField()
     items = InventoryRequestItemSerializer(many=True, allow_empty=False)
+
+
+class ModerationFieldReportSerializer(serializers.Serializer):
+    field_name = serializers.CharField(max_length=128)
+    comment = serializers.CharField(max_length=500, allow_blank=True, required=False, default='')
+    sku_id = serializers.UUIDField(required=False, allow_null=True)
 
 
 class ModerationDecisionSerializer(serializers.Serializer):
     idempotency_key = serializers.CharField(max_length=128)
     product_id = serializers.UUIDField()
-    status = serializers.ChoiceField(choices=[Product.Status.MODERATED, Product.Status.BLOCKED])
+    event_type = serializers.ChoiceField(choices=['MODERATED', 'BLOCKED'])
+    occurred_at = serializers.DateTimeField()
     hard_block = serializers.BooleanField(required=False, default=False)
-    blocking_reason = serializers.JSONField(required=False, allow_null=True)
-    field_reports = serializers.ListField(child=serializers.DictField(), required=False)
+    blocking_reason_id = serializers.CharField(max_length=128, required=False, allow_null=True)
+    moderator_id = serializers.UUIDField(required=False, allow_null=True)
+    moderator_comment = serializers.CharField(max_length=500, required=False, allow_blank=True)
+    field_reports = ModerationFieldReportSerializer(many=True, required=False)
 
 
 class InvoiceItemSerializer(serializers.ModelSerializer):

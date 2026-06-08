@@ -14,11 +14,11 @@ def _build_field_reports(payload):
         return reports
 
     reason = payload.get('reason') or {}
-    message = reason.get('comment') or reason.get('title') or 'Требуется исправление после модерации'
+    comment = reason.get('comment') or reason.get('title') or 'Требуется исправление после модерации'
     return [
         {
-            'field': str(field or '').strip(),
-            'message': message,
+            'field_name': str(field or '').strip(),
+            'comment': comment,
         }
         for field in reason.get('fields', [])
         if str(field or '').strip()
@@ -65,13 +65,19 @@ class Command(BaseCommand):
         if not product_id:
             return
 
+        decision_event_type = payload.get('event_type') or (
+            'MODERATED' if event_type == 'PRODUCT_APPROVED' else 'BLOCKED'
+        )
+        reason = payload.get('reason') or {}
         apply_moderation_decision(
             {
                 'idempotency_key': payload.get('idempotency_key') or f'{event_type}:{product_id}:{payload.get("moderated_at", "")}',
                 'product_id': product_id,
-                'status': Product.Status.MODERATED if event_type == 'PRODUCT_APPROVED' else Product.Status.BLOCKED,
+                'event_type': decision_event_type,
+                'occurred_at': payload.get('occurred_at') or payload.get('moderated_at'),
                 'hard_block': bool(payload.get('hard_block')),
-                'blocking_reason': payload.get('blocking_reason') or payload.get('reason'),
+                'blocking_reason_id': payload.get('blocking_reason_id') or reason.get('code'),
+                'moderator_comment': reason.get('comment') or reason.get('title'),
                 'field_reports': _build_field_reports(payload),
             }
         )

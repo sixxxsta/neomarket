@@ -415,12 +415,13 @@ class ApproveProductApiTests(TestCase):
         event = ModerationEvent.objects.get(product_id=card.product_id)
         self.assertEqual(event.event_type, ModerationEvent.EventType.PRODUCT_APPROVED)
         self.assertTrue(event.published)
-        self.assertEqual(event.payload['status'], 'MODERATED')
+        self.assertEqual(event.payload['event_type'], 'MODERATED')
         self.assertEqual(event.payload['idempotency_key'], f'approve:{card.id}')
 
         mock_b2b.assert_called_once()
         payload = mock_b2b.call_args[0][0]
-        self.assertEqual(payload['status'], 'MODERATED')
+        self.assertEqual(payload['event_type'], 'MODERATED')
+        self.assertIn('occurred_at', payload)
         self.assertEqual(payload['product_id'], str(card.product_id))
 
     def test_approve_others_card_returns_403(self):
@@ -507,8 +508,8 @@ class SoftBlockApiTests(TestCase):
             'blocking_reason_id': reason_code,
             'comment': 'Fix photos',
             'field_reports': [
-                {'field_name': 'images', 'message': 'Blurry photos'},
-                {'field_name': 'description', 'message': 'Add size chart'},
+                {'field_name': 'product_images', 'comment': 'Blurry photos'},
+                {'field_name': 'description', 'comment': 'Add size chart'},
             ],
         }
         payload.update(extra)
@@ -546,10 +547,12 @@ class SoftBlockApiTests(TestCase):
         client.post(f'/api/v1/products/{card.product_id}/decline', self._decline_payload(), format='json')
 
         payload = mock_b2b.call_args[0][0]
-        self.assertEqual(payload['status'], 'BLOCKED')
+        self.assertEqual(payload['event_type'], 'BLOCKED')
         self.assertFalse(payload['hard_block'])
         self.assertEqual(payload['idempotency_key'], f'soft-block:{card.id}')
-        self.assertEqual(payload['field_reports'][0]['field'], 'images')
+        self.assertEqual(payload['blocking_reason_id'], 'BAD_MEDIA')
+        self.assertEqual(payload['field_reports'][0]['field_name'], 'product_images')
+        self.assertEqual(payload['field_reports'][0]['comment'], 'Blurry photos')
 
     def test_soft_block_unknown_reason_returns_400(self):
         card, moderator_id = self._in_review_card()
@@ -581,7 +584,7 @@ class SoftBlockApiTests(TestCase):
         card, moderator_id = self._in_review_card()
         client = self._client_for(moderator_id)
         payload = self._decline_payload()
-        payload['field_reports'] = [{'field_name': 'unknown_field', 'message': 'Bad'}]
+        payload['field_reports'] = [{'field_name': 'unknown_field', 'comment': 'Bad'}]
 
         response = client.post(f'/api/v1/products/{card.product_id}/decline', payload, format='json')
         self.assertEqual(response.status_code, 400)
@@ -634,7 +637,7 @@ class HardBlockApiTests(TestCase):
         payload = {
             'blocking_reason_id': 'FORBIDDEN_CONTENT',
             'comment': 'Counterfeit listing',
-            'field_reports': [{'field_name': 'title', 'message': 'Prohibited item'}],
+            'field_reports': [{'field_name': 'title', 'comment': 'Prohibited item'}],
         }
         payload.update(extra)
         return payload
@@ -669,9 +672,10 @@ class HardBlockApiTests(TestCase):
         client.post(f'/api/v1/products/{card.product_id}/decline', self._hard_decline_payload(), format='json')
 
         payload = mock_b2b.call_args[0][0]
-        self.assertEqual(payload['status'], 'BLOCKED')
+        self.assertEqual(payload['event_type'], 'BLOCKED')
         self.assertTrue(payload['hard_block'])
         self.assertEqual(payload['idempotency_key'], f'hard-block:{card.id}')
+        self.assertEqual(payload['blocking_reason_id'], 'FORBIDDEN_CONTENT')
 
     def test_any_modify_on_hard_blocked_returns_403(self):
         card, moderator_id = self._in_review_card()
