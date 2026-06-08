@@ -20,7 +20,7 @@ class CartContractTests(TestCase):
             "/api/v1/favorites",
             "/api/v1/favorites/{product_id}",
             "/api/v1/favorites/{product_id}/subscribe",
-            "/api/v1/home/banners",
+            "/api/v1/catalog/banners",
             "/api/v1/main/collections",
             "/api/v1/collections/{collection_id}/products",
             "/api/v1/events/product",

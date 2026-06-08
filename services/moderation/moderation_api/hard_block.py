@@ -4,6 +4,7 @@ from django.db import transaction
 
 from .approve import _get_in_review_card
 from .b2b_client import post_moderation_decision
+from .b2b_payload import build_block_payload
 from .field_reports import normalize_field_reports
 from .models import BlockingReason, ModerationCard, ModerationEvent
 
@@ -58,23 +59,6 @@ def _validate_hard_block(card, moderator):
         )
 
 
-def _build_b2b_payload(card, reason, comment, field_reports):
-    idempotency_key = f'hard-block:{card.id}'
-    blocking_reason = {
-        'code': reason.code,
-        'title': reason.title,
-        'comment': comment,
-    }
-    return {
-        'idempotency_key': idempotency_key,
-        'product_id': str(card.product_id),
-        'status': 'BLOCKED',
-        'hard_block': True,
-        'blocking_reason': blocking_reason,
-        'field_reports': field_reports,
-    }, idempotency_key
-
-
 @transaction.atomic
 def hard_block_product(product_id, moderator, blocking_reason_id, comment='', field_reports=None):
     from .terminal import assert_product_not_hard_blocked
@@ -88,7 +72,14 @@ def hard_block_product(product_id, moderator, blocking_reason_id, comment='', fi
     _validate_hard_block(card, moderator)
 
     decided_at = datetime.now(timezone.utc)
-    b2b_payload, idempotency_key = _build_b2b_payload(card, reason, comment, normalized_reports)
+    b2b_payload, idempotency_key = build_block_payload(
+        card,
+        reason,
+        normalized_reports,
+        hard_block=True,
+        idempotency_prefix='hard-block',
+        decided_at=decided_at,
+    )
 
     existing_event = ModerationEvent.objects.filter(
         product_id=product_id,

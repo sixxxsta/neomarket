@@ -176,32 +176,30 @@ class CartApiTests(TestCase):
         response = self.client.get("/api/v1/favorites")
         self.assertEqual(response.status_code, 401)
 
-    def _post_favorite(self, product_id, query=""):
+    def _put_favorite(self, product_id, query=""):
         path = f"/api/v1/favorites/{product_id}/"
         if query:
             path = f"{path}?{query}"
-        return self.client.post(path, HTTP_AUTHORIZATION=self.auth)
+        return self.client.put(path, HTTP_AUTHORIZATION=self.auth)
 
     @patch("cart_api.views.requests.get")
-    def test_add_to_favorites_returns_201(self, mock_get):
+    def test_add_to_favorites_returns_204(self, mock_get):
         product_id = uuid.uuid4()
         mock_get.return_value = self._mock_response({"items": [self._catalog_product(product_id=product_id)]})
 
-        response = self._post_favorite(product_id)
-        self.assertEqual(response.status_code, 201)
-        self.assertEqual(str(response.data["product_id"]), str(product_id))
-        self.assertEqual(str(response.data["user_id"]), str(self.user_id))
+        response = self._put_favorite(product_id)
+        self.assertEqual(response.status_code, 204)
         self.assertTrue(Favorite.objects.filter(user_id=self.user_id, product_id=product_id).exists())
 
     @patch("cart_api.views.requests.get")
-    def test_repeat_add_returns_200_not_duplicate(self, mock_get):
+    def test_repeat_add_returns_204_not_duplicate(self, mock_get):
         mock_get.return_value = self._mock_response({"items": [self._catalog_product()]})
 
-        first = self._post_favorite(self.product_id)
-        self.assertEqual(first.status_code, 201)
+        first = self._put_favorite(self.product_id)
+        self.assertEqual(first.status_code, 204)
 
-        second = self._post_favorite(self.product_id)
-        self.assertEqual(second.status_code, 200)
+        second = self._put_favorite(self.product_id)
+        self.assertEqual(second.status_code, 204)
         self.assertEqual(
             Favorite.objects.filter(user_id=self.user_id, product_id=self.product_id).count(),
             1,
@@ -240,11 +238,11 @@ class CartApiTests(TestCase):
         Favorite.objects.create(user_id=other_user_id, product_id=other_product_id)
         mock_get.return_value = self._mock_response({"items": [self._catalog_product(product_id=self.product_id)]})
 
-        add_response = self._post_favorite(
+        add_response = self._put_favorite(
             self.product_id,
             query=f"user_id={other_user_id}",
         )
-        self.assertEqual(add_response.status_code, 201)
+        self.assertEqual(add_response.status_code, 204)
         self.assertTrue(Favorite.objects.filter(user_id=self.user_id, product_id=self.product_id).exists())
         self.assertFalse(Favorite.objects.filter(user_id=other_user_id, product_id=self.product_id).exists())
 
@@ -264,46 +262,44 @@ class CartApiTests(TestCase):
         return self.client.post(path, payload, format="json", HTTP_AUTHORIZATION=self.auth)
 
     @patch("cart_api.views.requests.get")
-    def test_subscribe_returns_201_with_notify_on(self, mock_get):
+    def test_subscribe_returns_204_with_events(self, mock_get):
         mock_get.return_value = self._mock_response({"items": [self._catalog_product()]})
-        response = self._post_subscribe(self.product_id, {"notify_on": ["IN_STOCK", "PRICE_DOWN"]})
-        self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data["notify_on"], ["IN_STOCK", "PRICE_DOWN"])
-        self.assertEqual(response.data["product"]["id"], str(self.product_id))
+        response = self._post_subscribe(self.product_id, {"events": ["BACK_IN_STOCK", "PRICE_DROP"]})
+        self.assertEqual(response.status_code, 204)
         subscription = Subscription.objects.get(user_id=self.user_id, product_id=self.product_id)
-        self.assertEqual(subscription.notify_on, ["IN_STOCK", "PRICE_DOWN"])
+        self.assertEqual(subscription.notify_on, ["BACK_IN_STOCK", "PRICE_DROP"])
 
     @patch("cart_api.views.requests.get")
     def test_duplicate_subscription_returns_409(self, mock_get):
         mock_get.return_value = self._mock_response({"items": [self._catalog_product()]})
-        payload = {"notify_on": ["IN_STOCK"]}
-        self.assertEqual(self._post_subscribe(self.product_id, payload).status_code, 201)
+        payload = {"events": ["BACK_IN_STOCK"]}
+        self.assertEqual(self._post_subscribe(self.product_id, payload).status_code, 204)
 
         duplicate = self._post_subscribe(self.product_id, payload)
         self.assertEqual(duplicate.status_code, 409)
         self.assertEqual(duplicate.data["code"], "SUBSCRIPTION_ALREADY_EXISTS")
         self.assertEqual(Subscription.objects.filter(user_id=self.user_id, product_id=self.product_id).count(), 1)
 
-    def test_invalid_notify_on_returns_400(self):
-        response = self._post_subscribe(self.product_id, {"notify_on": []})
+    def test_invalid_events_returns_400(self):
+        response = self._post_subscribe(self.product_id, {"events": []})
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.data["code"], "INVALID_NOTIFY_ON")
+        self.assertEqual(response.data["code"], "INVALID_EVENTS")
 
-        bad_event = self._post_subscribe(self.product_id, {"notify_on": ["UNKNOWN_EVENT"]})
+        bad_event = self._post_subscribe(self.product_id, {"events": ["UNKNOWN_EVENT"]})
         self.assertEqual(bad_event.status_code, 400)
 
     @patch("cart_api.views.requests.get")
     def test_subscribe_to_unknown_product_returns_404(self, mock_get):
         unknown_id = uuid.uuid4()
         mock_get.return_value = self._mock_response({"items": []})
-        response = self._post_subscribe(unknown_id, {"notify_on": ["IN_STOCK"]})
+        response = self._post_subscribe(unknown_id, {"events": ["BACK_IN_STOCK"]})
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.data["code"], "PRODUCT_NOT_FOUND")
 
     @patch("cart_api.views.requests.get")
     def test_unsubscribe_is_idempotent(self, mock_get):
         mock_get.return_value = self._mock_response({"items": [self._catalog_product()]})
-        self._post_subscribe(self.product_id, {"notify_on": ["IN_STOCK"]})
+        self._post_subscribe(self.product_id, {"events": ["BACK_IN_STOCK"]})
 
         first = self.client.delete(
             f"/api/v1/favorites/{self.product_id}/subscribe",
@@ -371,7 +367,7 @@ class CartApiTests(TestCase):
             placement="catalog",
         )
 
-        response = self.client.get("/api/v1/home/banners")
+        response = self.client.get("/api/v1/catalog/banners")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["total_count"], 2)
         self.assertEqual([item["id"] for item in response.data["items"]], [str(first.id), str(second.id)])
@@ -386,7 +382,7 @@ class CartApiTests(TestCase):
             placement=Banner.Placement.HOME,
         )
 
-        response = self.client.get("/api/v1/home/banners")
+        response = self.client.get("/api/v1/catalog/banners")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["items"], [])
         self.assertEqual(response.data["total_count"], 0)

@@ -38,9 +38,16 @@ class FavoriteListItemSerializer(serializers.ModelSerializer):
 
 
 class SubscribeRequestSerializer(serializers.Serializer):
-    notify_on = serializers.ListField(
-        child=serializers.ChoiceField(choices=[Subscription.NotifyEvent.IN_STOCK, Subscription.NotifyEvent.PRICE_DOWN]),
+    events = serializers.ListField(
+        child=serializers.ChoiceField(
+            choices=[
+                Subscription.NotifyEvent.BACK_IN_STOCK,
+                Subscription.NotifyEvent.PRICE_DROP,
+            ]
+        ),
         allow_empty=False,
+        required=False,
+        default=[Subscription.NotifyEvent.BACK_IN_STOCK, Subscription.NotifyEvent.PRICE_DROP],
     )
 
 

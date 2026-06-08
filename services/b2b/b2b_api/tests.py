@@ -419,7 +419,7 @@ class B2BApiTests(TestCase):
         product = self.create_product(status=Product.Status.BLOCKED, title='Blocked item')
         sku = self.create_sku(product)
         product.blocking_reason = {'title': 'Needs fix'}
-        product.field_reports = [{'field': 'images', 'message': 'Bad photo'}]
+        product.field_reports = [{'field_name': 'product_images', 'comment': 'Bad photo'}]
         product.save(update_fields=['blocking_reason', 'field_reports'])
 
         response = self._put_product(product.id, description='Fixed description')
@@ -532,6 +532,10 @@ class B2BApiTests(TestCase):
         self.assertEqual(moderation_delete.payload['snapshot_after']['skus'], [])
 
     def _post_moderation_event(self, payload, headers=None):
+        payload = {
+            'occurred_at': '2026-06-04T12:00:00Z',
+            **payload,
+        }
         return self.client.post(
             '/api/v1/events/moderation',
             payload,
@@ -543,13 +547,13 @@ class B2BApiTests(TestCase):
         product = self.create_product(
             status=Product.Status.BLOCKED,
             blocking_reason={'title': 'Previous block'},
-            field_reports=[{'field': 'title', 'message': 'Fix title'}],
+            field_reports=[{'field_name': 'title', 'comment': 'Fix title'}],
         )
         self.create_sku(product)
         payload = {
             'idempotency_key': 'evt-moderated-clear',
             'product_id': str(product.id),
-            'status': 'MODERATED',
+            'event_type': 'MODERATED',
         }
 
         response = self._post_moderation_event(payload)
@@ -576,10 +580,10 @@ class B2BApiTests(TestCase):
         payload = {
             'idempotency_key': 'evt-soft-block',
             'product_id': str(product.id),
-            'status': 'BLOCKED',
+            'event_type': 'BLOCKED',
             'hard_block': False,
-            'blocking_reason': {'title': 'Needs documents'},
-            'field_reports': [{'field': 'description', 'message': 'Need more details'}],
+            'blocking_reason_id': 'BAD_MEDIA',
+            'field_reports': [{'field_name': 'description', 'comment': 'Need more details'}],
         }
 
         response = self._post_moderation_event(payload)
@@ -587,8 +591,8 @@ class B2BApiTests(TestCase):
 
         product.refresh_from_db()
         self.assertEqual(product.status, Product.Status.BLOCKED)
-        self.assertEqual(product.blocking_reason['title'], 'Needs documents')
-        self.assertEqual(product.field_reports[0]['field'], 'description')
+        self.assertEqual(product.blocking_reason['code'], 'BAD_MEDIA')
+        self.assertEqual(product.field_reports[0]['field_name'], 'description')
 
         blocked_event = IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_BLOCKED').first()
         self.assertIsNotNone(blocked_event)
@@ -601,10 +605,10 @@ class B2BApiTests(TestCase):
         payload = {
             'idempotency_key': 'evt-hard-block',
             'product_id': str(product.id),
-            'status': 'BLOCKED',
+            'event_type': 'BLOCKED',
             'hard_block': True,
-            'blocking_reason': {'title': 'Forbidden category'},
-            'field_reports': [{'field': 'title', 'message': 'Not allowed'}],
+            'blocking_reason_id': 'FORBIDDEN_CONTENT',
+            'field_reports': [{'field_name': 'title', 'comment': 'Not allowed'}],
         }
 
         response = self._post_moderation_event(payload)
@@ -612,7 +616,7 @@ class B2BApiTests(TestCase):
 
         product.refresh_from_db()
         self.assertEqual(product.status, Product.Status.HARD_BLOCKED)
-        self.assertEqual(product.blocking_reason['title'], 'Forbidden category')
+        self.assertEqual(product.blocking_reason['code'], 'FORBIDDEN_CONTENT')
 
         blocked_event = IntegrationOutbox.objects.filter(aggregate_id=product.id, event_type='PRODUCT_BLOCKED').first()
         self.assertIsNotNone(blocked_event)
@@ -626,9 +630,9 @@ class B2BApiTests(TestCase):
             {
                 'idempotency_key': 'evt-hard-for-403',
                 'product_id': str(product.id),
-                'status': 'BLOCKED',
+                'event_type': 'BLOCKED',
                 'hard_block': True,
-                'blocking_reason': {'title': 'Terminal block'},
+                'blocking_reason_id': 'FORBIDDEN_CONTENT',
             }
         )
         product.refresh_from_db()
@@ -657,9 +661,9 @@ class B2BApiTests(TestCase):
         payload = {
             'idempotency_key': 'evt-dedupe',
             'product_id': str(product.id),
-            'status': 'BLOCKED',
-            'blocking_reason': {'title': 'Needs documents'},
-            'field_reports': [{'field': 'description', 'message': 'Need more details'}],
+            'event_type': 'BLOCKED',
+            'blocking_reason_id': 'BAD_MEDIA',
+            'field_reports': [{'field_name': 'description', 'comment': 'Need more details'}],
         }
 
         first = self._post_moderation_event(payload)
@@ -684,7 +688,7 @@ class B2BApiTests(TestCase):
             {
                 'idempotency_key': 'evt-no-key',
                 'product_id': str(product.id),
-                'status': 'MODERATED',
+                'event_type': 'MODERATED',
             },
             headers={},
         )
@@ -712,18 +716,19 @@ class B2BApiTests(TestCase):
         self.assertEqual(product.status, Product.Status.MODERATED)
         self.assertTrue(IntegrationInbox.objects.filter(message_id='stream-approve-1').exists())
 
-    def _post_reserve(self, idempotency_key, items):
+    def _post_reserve(self, idempotency_key, items, order_id=None):
+        order_id = order_id or uuid.uuid4()
         return self.client.post(
             '/api/v1/reserve',
-            {'idempotency_key': idempotency_key, 'items': items},
+            {'idempotency_key': idempotency_key, 'order_id': str(order_id), 'items': items},
             format='json',
             **self.service_headers,
         )
 
-    def _post_unreserve(self, idempotency_key, items):
+    def _post_unreserve(self, order_id, items):
         return self.client.post(
             '/api/v1/unreserve',
-            {'idempotency_key': idempotency_key, 'items': items},
+            {'order_id': str(order_id), 'items': items},
             format='json',
             **self.service_headers,
         )
@@ -735,14 +740,19 @@ class B2BApiTests(TestCase):
         on_hand_a = sku_a.active_quantity + sku_a.reserved_quantity
         on_hand_b = sku_b.active_quantity + sku_b.reserved_quantity
 
+        order_id = uuid.uuid4()
         response = self._post_reserve(
             'reserve-all-1',
             [
                 {'sku_id': str(sku_a.id), 'quantity': 2},
                 {'sku_id': str(sku_b.id), 'quantity': 1},
             ],
+            order_id=order_id,
         )
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['status'], 'RESERVED')
+        self.assertEqual(response.data['order_id'], str(order_id))
+        self.assertIn('reserved_at', response.data)
 
         sku_a.refresh_from_db()
         sku_b.refresh_from_db()
@@ -779,10 +789,11 @@ class B2BApiTests(TestCase):
         product = self.create_product(status=Product.Status.MODERATED)
         sku = self.create_sku(product, active_quantity=10, reserved_quantity=0)
 
-        first = self._post_reserve('reserve-idem-1', [{'sku_id': str(sku.id), 'quantity': 3}])
+        order_id = uuid.uuid4()
+        first = self._post_reserve('reserve-idem-1', [{'sku_id': str(sku.id), 'quantity': 3}], order_id=order_id)
         self.assertEqual(first.status_code, 200)
 
-        duplicate = self._post_reserve('reserve-idem-1', [{'sku_id': str(sku.id), 'quantity': 3}])
+        duplicate = self._post_reserve('reserve-idem-1', [{'sku_id': str(sku.id), 'quantity': 3}], order_id=order_id)
         self.assertEqual(duplicate.status_code, 200)
         self.assertEqual(duplicate.data, first.data)
 
@@ -813,13 +824,20 @@ class B2BApiTests(TestCase):
         product = self.create_product(status=Product.Status.MODERATED)
         sku = self.create_sku(product, active_quantity=10, reserved_quantity=0)
 
-        self.assertEqual(self._post_reserve('reserve-un-1', [{'sku_id': str(sku.id), 'quantity': 4}]).status_code, 200)
+        order_id = uuid.uuid4()
+        self.assertEqual(
+            self._post_reserve('reserve-un-1', [{'sku_id': str(sku.id), 'quantity': 4}], order_id=order_id).status_code,
+            200,
+        )
         sku.refresh_from_db()
         self.assertEqual(sku.active_quantity, 6)
         self.assertEqual(sku.reserved_quantity, 4)
 
-        response = self._post_unreserve('unreserve-1', [{'sku_id': str(sku.id), 'quantity': 2}])
+        response = self._post_unreserve(order_id, [{'sku_id': str(sku.id), 'quantity': 2}])
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['status'], 'UNRESERVED')
+        self.assertEqual(response.data['order_id'], str(order_id))
+        self.assertIn('processed_at', response.data)
 
         sku.refresh_from_db()
         self.assertEqual(sku.active_quantity, 8)
@@ -837,13 +855,20 @@ class B2BApiTests(TestCase):
     def test_fulfill_decreases_reserved_quantity(self):
         product = self.create_product(status=Product.Status.MODERATED)
         sku = self.create_sku(product, active_quantity=10, reserved_quantity=0)
+        order_id = uuid.uuid4()
 
-        self.assertEqual(self._post_reserve('reserve-fulfill-1', [{'sku_id': str(sku.id), 'quantity': 5}]).status_code, 200)
+        self.assertEqual(
+            self._post_reserve('reserve-fulfill-1', [{'sku_id': str(sku.id), 'quantity': 5}], order_id=order_id).status_code,
+            200,
+        )
         sku.refresh_from_db()
         self.assertEqual(sku.reserved_quantity, 5)
 
-        response = self._post_fulfill('order-fulfill-1', [{'sku_id': str(sku.id), 'quantity': 2}])
+        response = self._post_fulfill(str(order_id), [{'sku_id': str(sku.id), 'quantity': 2}])
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['status'], 'FULFILLED')
+        self.assertEqual(response.data['order_id'], str(order_id))
+        self.assertIn('processed_at', response.data)
 
         sku.refresh_from_db()
         self.assertEqual(sku.reserved_quantity, 3)
@@ -851,14 +876,18 @@ class B2BApiTests(TestCase):
     def test_active_quantity_unchanged(self):
         product = self.create_product(status=Product.Status.MODERATED)
         sku = self.create_sku(product, active_quantity=10, reserved_quantity=0)
+        order_id = uuid.uuid4()
 
-        self.assertEqual(self._post_reserve('reserve-fulfill-2', [{'sku_id': str(sku.id), 'quantity': 4}]).status_code, 200)
+        self.assertEqual(
+            self._post_reserve('reserve-fulfill-2', [{'sku_id': str(sku.id), 'quantity': 4}], order_id=order_id).status_code,
+            200,
+        )
         sku.refresh_from_db()
         active_after_reserve = sku.active_quantity
         self.assertEqual(active_after_reserve, 6)
         self.assertEqual(sku.reserved_quantity, 4)
 
-        response = self._post_fulfill('order-fulfill-2', [{'sku_id': str(sku.id), 'quantity': 3}])
+        response = self._post_fulfill(str(order_id), [{'sku_id': str(sku.id), 'quantity': 3}])
         self.assertEqual(response.status_code, 200)
 
         sku.refresh_from_db()
@@ -868,29 +897,33 @@ class B2BApiTests(TestCase):
     def test_idempotent_fulfill_no_double_deduction(self):
         product = self.create_product(status=Product.Status.MODERATED)
         sku = self.create_sku(product, active_quantity=8, reserved_quantity=0)
+        order_id = uuid.uuid4()
 
-        self.assertEqual(self._post_reserve('reserve-fulfill-3', [{'sku_id': str(sku.id), 'quantity': 3}]).status_code, 200)
+        self.assertEqual(
+            self._post_reserve('reserve-fulfill-3', [{'sku_id': str(sku.id), 'quantity': 3}], order_id=order_id).status_code,
+            200,
+        )
         items = [{'sku_id': str(sku.id), 'quantity': 2}]
-        first = self._post_fulfill('order-fulfill-3', items)
+        first = self._post_fulfill(str(order_id), items)
         self.assertEqual(first.status_code, 200)
 
         sku.refresh_from_db()
         self.assertEqual(sku.reserved_quantity, 1)
-        op_count = InventoryOperation.objects.filter(key='FULFILL:order-fulfill-3').count()
+        op_count = InventoryOperation.objects.filter(key=f'FULFILL:{order_id}').count()
 
-        duplicate = self._post_fulfill('order-fulfill-3', items)
+        duplicate = self._post_fulfill(str(order_id), items)
         self.assertEqual(duplicate.status_code, 200)
         self.assertEqual(duplicate.data, first.data)
 
         sku.refresh_from_db()
         self.assertEqual(sku.reserved_quantity, 1)
-        self.assertEqual(InventoryOperation.objects.filter(key='FULFILL:order-fulfill-3').count(), op_count)
+        self.assertEqual(InventoryOperation.objects.filter(key=f'FULFILL:{order_id}').count(), op_count)
 
     def test_fulfill_missing_service_key_returns_401(self):
         product = self.create_product(status=Product.Status.MODERATED)
         sku = self.create_sku(product, active_quantity=5, reserved_quantity=2)
 
-        response = self._post_fulfill('order-no-key', [{'sku_id': str(sku.id), 'quantity': 1}], headers={})
+        response = self._post_fulfill(str(uuid.uuid4()), [{'sku_id': str(sku.id), 'quantity': 1}], headers={})
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.data['code'], 'UNAUTHORIZED')
 
@@ -925,7 +958,7 @@ class B2BApiTests(TestCase):
     def test_catalog_returns_moderated_in_stock_products(self):
         fixtures = self._create_catalog_visibility_fixtures()
 
-        response = self.client.get('/api/v1/products?limit=50&offset=0', **self.service_headers)
+        response = self.client.get('/api/v1/public/products?limit=50&offset=0', **self.service_headers)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['total'], 1)
 
@@ -944,7 +977,7 @@ class B2BApiTests(TestCase):
     def test_catalog_excludes_hard_blocked(self):
         fixtures = self._create_catalog_visibility_fixtures()
 
-        response = self.client.get('/api/v1/products?limit=50&offset=0', **self.service_headers)
+        response = self.client.get('/api/v1/public/products?limit=50&offset=0', **self.service_headers)
         self.assertEqual(response.status_code, 200)
         returned_ids = {row['id'] for row in response.data['items']}
         self.assertNotIn(str(fixtures['hard_blocked_product'].id), returned_ids)
@@ -952,14 +985,21 @@ class B2BApiTests(TestCase):
     def test_catalog_missing_service_key_returns_401(self):
         self._create_catalog_visibility_fixtures()
 
-        response = self.client.get('/api/v1/products?limit=10&offset=0')
+        response = self.client.get('/api/v1/public/products?limit=10&offset=0')
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.data['code'], 'UNAUTHORIZED')
+
+    def test_seller_products_without_jwt_returns_401(self):
+        self._create_catalog_visibility_fixtures()
+
+        response = self.client.get('/api/v1/products?limit=10&offset=0', **self.service_headers)
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.data['code'], 'UNAUTHORIZED')
 
     def test_catalog_response_has_no_cost_price(self):
         fixtures = self._create_catalog_visibility_fixtures()
 
-        response = self.client.get('/api/v1/products?limit=10&offset=0', **self.service_headers)
+        response = self.client.get('/api/v1/public/products?limit=10&offset=0', **self.service_headers)
         self.assertEqual(response.status_code, 200)
         sku_payload = response.data['items'][0]['skus'][0]
         self.assertEqual(sku_payload['id'], str(fixtures['visible_sku'].id))
@@ -971,7 +1011,7 @@ class B2BApiTests(TestCase):
         visible = fixtures['visible_product']
 
         response = self.client.get(
-            f'/api/v1/products?ids={visible.id},{fixtures["blocked_product"].id},{fixtures["deleted_product"].id}',
+            f'/api/v1/public/products?ids={visible.id},{fixtures["blocked_product"].id},{fixtures["deleted_product"].id}',
             **self.service_headers,
         )
         self.assertEqual(response.status_code, 200)
@@ -1185,8 +1225,8 @@ class B2BApiTests(TestCase):
             status=Product.Status.BLOCKED,
             blocking_reason={'title': 'Policy violation', 'id': str(uuid.uuid4())},
             field_reports=[
-                {'field': 'title', 'message': 'Fix product title'},
-                {'field': 'description', 'message': 'Need details'},
+                {'field_name': 'title', 'comment': 'Fix product title'},
+                {'field_name': 'description', 'comment': 'Need details'},
             ],
         )
         self.create_sku(product, active_quantity=1)
@@ -1196,7 +1236,7 @@ class B2BApiTests(TestCase):
         self.assertEqual(response.data['status'], Product.Status.BLOCKED)
         self.assertEqual(response.data['blocking_reason']['title'], 'Policy violation')
         self.assertEqual(len(response.data['field_reports']), 2)
-        self.assertEqual(response.data['field_reports'][0]['field'], 'title')
+        self.assertEqual(response.data['field_reports'][0]['field_name'], 'title')
 
     def test_get_others_product_returns_404(self):
         foreign_product = self.create_product(seller_id=self.other_seller_id, status=Product.Status.MODERATED)
@@ -1289,7 +1329,11 @@ class B2BApiTests(TestCase):
 
         response = self.client.post(
             '/api/v1/reserve',
-            {'idempotency_key': 'reserve-no-key', 'items': [{'sku_id': str(sku.id), 'quantity': 1}]},
+            {
+                'idempotency_key': 'reserve-no-key',
+                'order_id': str(uuid.uuid4()),
+                'items': [{'sku_id': str(sku.id), 'quantity': 1}],
+            },
             format='json',
         )
         self.assertEqual(response.status_code, 401)

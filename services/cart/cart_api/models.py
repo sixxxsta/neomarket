@@ -54,8 +54,8 @@ class Favorite(models.Model):
 
 class Subscription(models.Model):
     class NotifyEvent(models.TextChoices):
-        IN_STOCK = "IN_STOCK", "IN_STOCK"
-        PRICE_DOWN = "PRICE_DOWN", "PRICE_DOWN"
+        BACK_IN_STOCK = "BACK_IN_STOCK", "BACK_IN_STOCK"
+        PRICE_DROP = "PRICE_DROP", "PRICE_DROP"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user_id = models.UUIDField(db_index=True)

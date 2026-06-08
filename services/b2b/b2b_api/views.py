@@ -40,6 +40,7 @@ from .serializers import (
     SellerProfileSerializer,
     SellerProfileUpdateSerializer,
     SkuSerializer,
+    UnreserveRequestSerializer,
     UpdateProductRequestSerializer,
     UpdateSkuRequestSerializer,
 )
@@ -209,23 +210,24 @@ def _normalize_field_reports(field_reports):
     normalized = []
     for item in field_reports or []:
         if isinstance(item, dict):
-            field_name = str(item.get('field') or item.get('name') or '').strip()
-            message = str(item.get('message') or item.get('comment') or item.get('title') or '').strip()
-            if field_name or message:
-                normalized.append(
-                    {
-                        'field': field_name,
-                        'message': message or 'Требуется исправление после модерации',
-                    }
-                )
+            field_name = str(item.get('field_name') or item.get('field') or item.get('name') or '').strip()
+            comment = str(item.get('comment') or item.get('message') or item.get('title') or '').strip()
+            if field_name or comment:
+                report = {
+                    'field_name': field_name,
+                    'comment': comment or 'Требуется исправление после модерации',
+                }
+                if item.get('sku_id'):
+                    report['sku_id'] = str(item['sku_id'])
+                normalized.append(report)
             continue
 
         text = str(item or '').strip()
         if text:
             normalized.append(
                 {
-                    'field': text,
-                    'message': 'Требуется исправление после модерации',
+                    'field_name': text,
+                    'comment': 'Требуется исправление после модерации',
                 }
             )
     return normalized
@@ -256,34 +258,49 @@ def apply_moderation_decision(validated_data):
         return None
 
     snapshot_before = _serialize_product_snapshot(product)
-    decision_status = validated_data['status']
+    decision_status = validated_data['event_type']
     field_reports = _normalize_field_reports(validated_data.get('field_reports', []))
 
-    if decision_status == Product.Status.MODERATED:
+    if decision_status == 'MODERATED':
         product.status = Product.Status.MODERATED
         _clear_blocking_state(product)
     else:
         product.status = Product.Status.HARD_BLOCKED if validated_data.get('hard_block') else Product.Status.BLOCKED
-        product.blocking_reason = validated_data.get('blocking_reason') or {'title': 'Moderation blocked the product'}
+        reason_id = validated_data.get('blocking_reason_id')
+        moderator_comment = validated_data.get('moderator_comment') or ''
+        product.blocking_reason = {
+            'code': reason_id,
+            'title': moderator_comment or reason_id or 'Moderation blocked the product',
+        }
         product.field_reports = field_reports
 
     product.save(update_fields=['status', 'blocking_reason', 'field_reports', 'updated_at'])
+    occurred_at = validated_data['occurred_at']
+    if hasattr(occurred_at, 'isoformat'):
+        occurred_at = occurred_at.isoformat()
+    inbox_payload = {
+        'idempotency_key': validated_data['idempotency_key'],
+        'product_id': str(validated_data['product_id']),
+        'event_type': validated_data['event_type'],
+        'occurred_at': occurred_at,
+        'hard_block': validated_data.get('hard_block', False),
+        'blocking_reason_id': validated_data.get('blocking_reason_id'),
+        'moderator_id': str(validated_data['moderator_id']) if validated_data.get('moderator_id') else None,
+        'moderator_comment': validated_data.get('moderator_comment'),
+        'field_reports': field_reports,
+    }
     try:
         IntegrationInbox.objects.create(
             message_id=event_key,
             source='moderation',
             event_type=f'MODERATION_{decision_status}',
-            payload={
-                **validated_data,
-                'product_id': str(validated_data['product_id']),
-                'field_reports': field_reports,
-            },
+            payload=inbox_payload,
         )
     except IntegrityError:
         return _product_for_moderation_response(validated_data['product_id'])
     _send_product_event(product, 'PRODUCT_UPDATED', 'UPDATED', snapshot_before=snapshot_before)
 
-    if decision_status != Product.Status.MODERATED:
+    if decision_status != 'MODERATED':
         _outbox_event(
             product.id,
             'PRODUCT_BLOCKED',
@@ -298,10 +315,19 @@ def apply_moderation_decision(validated_data):
     return product
 
 
-def _inventory_operation_response(items, message):
+def _reserve_response(order_id, reserved_at):
     return {
-        'items': items,
-        'message': message,
+        'order_id': str(order_id),
+        'status': 'RESERVED',
+        'reserved_at': reserved_at.isoformat(),
+    }
+
+
+def _inventory_order_response(order_id, status_value, processed_at):
+    return {
+        'order_id': str(order_id),
+        'status': status_value,
+        'processed_at': processed_at.isoformat(),
     }
 
 
@@ -420,12 +446,6 @@ class SellerProfileView(APIView):
 )
 class ProductsView(APIView):
     def get(self, request):
-        if not _looks_like_seller_request(request):
-            error = _require_service_key(request)
-            if error:
-                return error
-            return self._catalog_view(request)
-
         seller_id, error = _get_seller_id(request)
         if error:
             return error
@@ -980,6 +1000,7 @@ class ReserveView(APIView):
             return _error('BAD_REQUEST', serializer.errors, status.HTTP_400_BAD_REQUEST)
 
         key = serializer.validated_data['idempotency_key']
+        order_id = serializer.validated_data['order_id']
         existing = InventoryOperation.objects.filter(key=key).first()
         if existing:
             if existing.kind != InventoryOperation.Kind.RESERVE:
@@ -993,7 +1014,7 @@ class ReserveView(APIView):
         if validation_error:
             return validation_error
 
-        response_items = []
+        reserved_at = datetime.now(timezone.utc)
         for item in requested_items:
             sku = sku_map[item['sku_id']]
             sku.active_quantity -= item['quantity']
@@ -1001,15 +1022,8 @@ class ReserveView(APIView):
             sku.save(update_fields=['active_quantity', 'reserved_quantity', 'updated_at'])
             if sku.active_quantity == 0:
                 _send_sku_stock_event(sku)
-            response_items.append(
-                {
-                    'sku_id': str(sku.id),
-                    'active_quantity': sku.active_quantity,
-                    'reserved_quantity': sku.reserved_quantity,
-                }
-            )
 
-        payload = _inventory_operation_response(response_items, 'Inventory reserved')
+        payload = _reserve_response(order_id, reserved_at)
         InventoryOperation.objects.create(key=key, kind=InventoryOperation.Kind.RESERVE, payload=payload)
         return Response(payload)
 
@@ -1021,15 +1035,16 @@ class UnreserveView(APIView):
         if error:
             return error
 
-        serializer = ReserveRequestSerializer(data=request.data)
+        serializer = UnreserveRequestSerializer(data=request.data)
         if not serializer.is_valid():
             return _error('BAD_REQUEST', serializer.errors, status.HTTP_400_BAD_REQUEST)
 
-        key = serializer.validated_data['idempotency_key']
+        order_id = serializer.validated_data['order_id']
+        key = f'UNRESERVE:{order_id}'
         existing = InventoryOperation.objects.filter(key=key).first()
         if existing:
             if existing.kind != InventoryOperation.Kind.UNRESERVE:
-                return _error('CONFLICT', 'Idempotency key already used by another operation', status.HTTP_409_CONFLICT)
+                return _error('CONFLICT', 'Order already processed by another operation', status.HTTP_409_CONFLICT)
             return Response(existing.payload)
 
         requested_items = serializer.validated_data['items']
@@ -1038,26 +1053,19 @@ class UnreserveView(APIView):
         if len(sku_map) != len(set(sku_ids)):
             return _error('BAD_REQUEST', 'One or more SKU ids are invalid', status.HTTP_400_BAD_REQUEST)
 
-        response_items = []
         for item in requested_items:
             sku = sku_map[item['sku_id']]
             if int(sku.reserved_quantity or 0) < item['quantity']:
                 return _error('CONFLICT', 'Cannot unreserve more than reserved quantity', status.HTTP_409_CONFLICT)
 
+        processed_at = datetime.now(timezone.utc)
         for item in requested_items:
             sku = sku_map[item['sku_id']]
             sku.active_quantity += item['quantity']
             sku.reserved_quantity -= item['quantity']
             sku.save(update_fields=['active_quantity', 'reserved_quantity', 'updated_at'])
-            response_items.append(
-                {
-                    'sku_id': str(sku.id),
-                    'active_quantity': sku.active_quantity,
-                    'reserved_quantity': sku.reserved_quantity,
-                }
-            )
 
-        payload = _inventory_operation_response(response_items, 'Inventory unreserved')
+        payload = _inventory_order_response(order_id, 'UNRESERVED', processed_at)
         InventoryOperation.objects.create(key=key, kind=InventoryOperation.Kind.UNRESERVE, payload=payload)
         return Response(payload)
 
@@ -1073,7 +1081,8 @@ class FulfillView(APIView):
         if not serializer.is_valid():
             return _error('BAD_REQUEST', serializer.errors, status.HTTP_400_BAD_REQUEST)
 
-        key = f'FULFILL:{serializer.validated_data["order_id"]}'
+        order_id = serializer.validated_data['order_id']
+        key = f'FULFILL:{order_id}'
         existing = InventoryOperation.objects.filter(key=key).first()
         if existing:
             if existing.kind != InventoryOperation.Kind.FULFILL:
@@ -1086,25 +1095,18 @@ class FulfillView(APIView):
         if len(sku_map) != len(set(sku_ids)):
             return _error('BAD_REQUEST', 'One or more SKU ids are invalid', status.HTTP_400_BAD_REQUEST)
 
-        response_items = []
         for item in requested_items:
             sku = sku_map[item['sku_id']]
             if int(sku.reserved_quantity or 0) < item['quantity']:
                 return _error('CONFLICT', 'Cannot fulfill more than reserved quantity', status.HTTP_409_CONFLICT)
 
+        processed_at = datetime.now(timezone.utc)
         for item in requested_items:
             sku = sku_map[item['sku_id']]
             sku.reserved_quantity -= item['quantity']
             sku.save(update_fields=['reserved_quantity', 'updated_at'])
-            response_items.append(
-                {
-                    'sku_id': str(sku.id),
-                    'active_quantity': sku.active_quantity,
-                    'reserved_quantity': sku.reserved_quantity,
-                }
-            )
 
-        payload = _inventory_operation_response(response_items, 'Fulfill applied')
+        payload = _inventory_order_response(order_id, 'FULFILLED', processed_at)
         try:
             InventoryOperation.objects.create(key=key, kind=InventoryOperation.Kind.FULFILL, payload=payload)
         except IntegrityError:

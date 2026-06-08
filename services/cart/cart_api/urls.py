@@ -50,6 +50,6 @@ urlpatterns = [
     path("main/collections/", MainCollectionsView.as_view(), name="main-collections"),
     path("collections/<uuid:collection_id>/products", CollectionProductsView.as_view(), name="collection-products-no-slash"),
     path("collections/<uuid:collection_id>/products/", CollectionProductsView.as_view(), name="collection-products"),
-    path("home/banners", HomeBannersView.as_view(), name="home-banners-no-slash"),
-    path("home/banners/", HomeBannersView.as_view(), name="home-banners"),
+    path("catalog/banners", HomeBannersView.as_view(), name="catalog-banners-no-slash"),
+    path("catalog/banners/", HomeBannersView.as_view(), name="catalog-banners"),
 ]

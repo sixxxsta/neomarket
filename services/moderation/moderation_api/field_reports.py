@@ -1,22 +1,38 @@
 from rest_framework import serializers
 
-ALLOWED_FIELD_NAMES = frozenset(
+CANONICAL_FIELD_NAMES = frozenset(
     {
         'title',
         'description',
-        'images',
-        'price',
+        'product_images',
+        'sku_name',
+        'sku_image',
+        'sku_price',
         'category',
-        'skus',
         'characteristics',
         'brand',
     }
 )
 
+FIELD_ALIASES = {
+    'images': 'product_images',
+    'image': 'product_images',
+    'price': 'sku_price',
+    'skus': 'sku_name',
+}
+
 
 class FieldReportItemSerializer(serializers.Serializer):
     field_name = serializers.CharField(max_length=64)
-    message = serializers.CharField(max_length=500, allow_blank=True, required=False, default='')
+    comment = serializers.CharField(max_length=500, allow_blank=True, required=False, default='')
+    sku_id = serializers.UUIDField(required=False, allow_null=True)
+
+
+def _canonical_field_name(raw_name):
+    field_name = str(raw_name or '').strip()
+    if not field_name:
+        return ''
+    return FIELD_ALIASES.get(field_name, field_name)
 
 
 def normalize_field_reports(field_reports, error_cls=None):
@@ -29,20 +45,22 @@ def normalize_field_reports(field_reports, error_cls=None):
     for item in field_reports or []:
         if not isinstance(item, dict):
             continue
-        field_name = str(item.get('field_name') or item.get('field') or '').strip()
-        message = str(item.get('message') or '').strip()
+        field_name = _canonical_field_name(item.get('field_name') or item.get('field'))
+        comment = str(item.get('comment') or item.get('message') or '').strip()
+        sku_id = item.get('sku_id')
         if not field_name:
             continue
-        if field_name not in ALLOWED_FIELD_NAMES:
+        if field_name not in CANONICAL_FIELD_NAMES:
             raise error_cls(
                 'INVALID_FIELD_NAME',
                 f'Unknown field name: {field_name}',
                 400,
             )
-        normalized.append(
-            {
-                'field': field_name,
-                'message': message or 'Требуется исправление после модерации',
-            }
-        )
+        report = {
+            'field_name': field_name,
+            'comment': comment or 'Требуется исправление после модерации',
+        }
+        if sku_id:
+            report['sku_id'] = str(sku_id)
+        normalized.append(report)
     return normalized
