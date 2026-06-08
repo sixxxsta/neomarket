@@ -275,16 +275,26 @@ def apply_moderation_decision(validated_data):
         product.field_reports = field_reports
 
     product.save(update_fields=['status', 'blocking_reason', 'field_reports', 'updated_at'])
+    occurred_at = validated_data['occurred_at']
+    if hasattr(occurred_at, 'isoformat'):
+        occurred_at = occurred_at.isoformat()
+    inbox_payload = {
+        'idempotency_key': validated_data['idempotency_key'],
+        'product_id': str(validated_data['product_id']),
+        'event_type': validated_data['event_type'],
+        'occurred_at': occurred_at,
+        'hard_block': validated_data.get('hard_block', False),
+        'blocking_reason_id': validated_data.get('blocking_reason_id'),
+        'moderator_id': str(validated_data['moderator_id']) if validated_data.get('moderator_id') else None,
+        'moderator_comment': validated_data.get('moderator_comment'),
+        'field_reports': field_reports,
+    }
     try:
         IntegrationInbox.objects.create(
             message_id=event_key,
             source='moderation',
             event_type=f'MODERATION_{decision_status}',
-            payload={
-                **validated_data,
-                'product_id': str(validated_data['product_id']),
-                'field_reports': field_reports,
-            },
+            payload=inbox_payload,
         )
     except IntegrityError:
         return _product_for_moderation_response(validated_data['product_id'])
