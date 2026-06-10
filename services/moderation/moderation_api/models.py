@@ -4,6 +4,7 @@ from django.db import models
 
 
 class BlockingReason(models.Model):
+    reason_uuid = models.UUIDField(default=uuid.uuid4, editable=False, unique=True, db_index=True)
     code = models.SlugField(primary_key=True, max_length=64)
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)
@@ -42,6 +43,7 @@ class ModerationCard(models.Model):
         PENDING = 'PENDING', 'PENDING'
         IN_REVIEW = 'IN_REVIEW', 'IN_REVIEW'
         APPROVED = 'APPROVED', 'APPROVED'
+        BLOCKED = 'BLOCKED', 'BLOCKED'
         DECLINED = 'DECLINED', 'DECLINED'
         HARD_BLOCKED = 'HARD_BLOCKED', 'HARD_BLOCKED'
         ARCHIVED = 'ARCHIVED', 'ARCHIVED'

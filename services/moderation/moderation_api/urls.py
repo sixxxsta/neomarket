@@ -4,9 +4,9 @@ from .views import (
     BlockingReasonsView,
     ModerationEnqueueView,
     ModerationNextCardView,
-    ProductApproveView,
-    ProductDeclineView,
     ProductEventsView,
+    TicketApproveView,
+    TicketBlockView,
 )
 
 
@@ -17,10 +17,10 @@ urlpatterns = [
     path('product-moderation/get-next/', ModerationNextCardView.as_view(), name='moderation-get-next'),
     path('product-moderation/enqueue', ModerationEnqueueView.as_view(), name='moderation-enqueue-no-slash'),
     path('product-moderation/enqueue/', ModerationEnqueueView.as_view(), name='moderation-enqueue'),
-    path('products/<uuid:id>/approve', ProductApproveView.as_view(), name='moderation-approve-no-slash'),
-    path('products/<uuid:id>/approve/', ProductApproveView.as_view(), name='moderation-approve'),
-    path('products/<uuid:id>/decline', ProductDeclineView.as_view(), name='moderation-decline-no-slash'),
-    path('products/<uuid:id>/decline/', ProductDeclineView.as_view(), name='moderation-decline'),
+    path('tickets/<uuid:ticket_id>/approve', TicketApproveView.as_view(), name='moderation-ticket-approve-no-slash'),
+    path('tickets/<uuid:ticket_id>/approve/', TicketApproveView.as_view(), name='moderation-ticket-approve'),
+    path('tickets/<uuid:ticket_id>/block', TicketBlockView.as_view(), name='moderation-ticket-block-no-slash'),
+    path('tickets/<uuid:ticket_id>/block/', TicketBlockView.as_view(), name='moderation-ticket-block'),
     path('product-blocking-reasons', BlockingReasonsView.as_view(), name='moderation-reasons-no-slash'),
     path('product-blocking-reasons/', BlockingReasonsView.as_view(), name='moderation-reasons'),
 ]

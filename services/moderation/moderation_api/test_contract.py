@@ -15,8 +15,8 @@ class ModerationContractTests(TestCase):
             '/api/v1/events/product',
             '/api/v1/product-moderation/get-next',
             '/api/v1/product-moderation/enqueue',
-            '/api/v1/products/{id}/approve',
-            '/api/v1/products/{id}/decline',
+            '/api/v1/tickets/{ticket_id}/approve',
+            '/api/v1/tickets/{ticket_id}/block',
             '/api/v1/product-blocking-reasons',
         ]
 

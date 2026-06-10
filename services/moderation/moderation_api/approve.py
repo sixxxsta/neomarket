@@ -1,10 +1,12 @@
 from datetime import datetime, timezone
 
 from django.db import transaction
-from .b2b_client import post_moderation_decision
+
+from .b2b_delivery import deliver_moderation_decision
 from .b2b_payload import build_approve_payload
 from .models import ModerationCard, ModerationEvent
 from .queue import _has_live_skus
+from .ticket_response import build_ticket_response
 
 
 class ApproveError(Exception):
@@ -25,35 +27,20 @@ def _edited_during_review(card):
     return card.updated_at > card.review_started_at
 
 
-def _deliver_to_b2b(payload):
-    result, error_kind = post_moderation_decision(payload)
-    if error_kind == 'unconfigured':
-        raise ApproveError('B2B_NOT_CONFIGURED', 'B2B moderation endpoint is not configured', 503)
-    if error_kind == 'unavailable':
-        raise ApproveError('B2B_UNAVAILABLE', 'B2B service is temporarily unavailable', 503)
-    http_status, _data = result
-    if http_status == 404:
-        raise ApproveError('PRODUCT_NOT_FOUND', 'Product not found in B2B catalog', 404)
-    if http_status not in (200, 201):
-        raise ApproveError('B2B_UNAVAILABLE', 'B2B service rejected moderation decision', 503)
-    return True
-
-
-def _get_in_review_card(product_id):
+def _get_in_review_card(ticket_id):
     return (
         ModerationCard.objects.select_for_update()
         .filter(
-            product_id=product_id,
+            id=ticket_id,
             queue_status=ModerationCard.QueueStatus.IN_REVIEW,
         )
-        .order_by('-review_started_at', '-created_at')
         .first()
     )
 
 
 def _validate_approve(card, moderator):
     if not card:
-        raise ApproveError('NOT_FOUND', 'Product is not in moderation review', 404)
+        raise ApproveError('NOT_FOUND', 'Ticket is not in moderation review', 404)
 
     if card.assigned_to != moderator:
         raise ApproveError(
@@ -86,27 +73,32 @@ def _validate_approve(card, moderator):
 
 
 @transaction.atomic
-def approve_product(product_id, moderator):
+def approve_ticket(ticket_id, moderator):
     from .terminal import assert_product_not_hard_blocked
 
-    assert_product_not_hard_blocked(product_id, ApproveError)
+    card = ModerationCard.objects.filter(id=ticket_id).first()
+    if not card:
+        raise ApproveError('NOT_FOUND', 'Ticket is not in moderation review', 404)
 
-    card = _get_in_review_card(product_id)
+    assert_product_not_hard_blocked(card.product_id, ApproveError)
+
+    card = _get_in_review_card(ticket_id)
     _validate_approve(card, moderator)
 
     decided_at = datetime.now(timezone.utc)
     b2b_payload, idempotency_key = build_approve_payload(card, decided_at)
 
     existing_event = ModerationEvent.objects.filter(
-        product_id=product_id,
+        product_id=card.product_id,
         event_type=ModerationEvent.EventType.PRODUCT_APPROVED,
         payload__idempotency_key=idempotency_key,
         published=True,
     ).first()
     if existing_event:
-        return {'product_id': str(product_id), 'status': 'MODERATED'}
+        card.refresh_from_db()
+        return build_ticket_response(card)
 
-    _deliver_to_b2b(b2b_payload)
+    deliver_moderation_decision(b2b_payload, error_cls=ApproveError)
 
     card.queue_status = ModerationCard.QueueStatus.APPROVED
     card.decided_by = moderator
@@ -126,7 +118,7 @@ def approve_product(product_id, moderator):
 
     ModerationEvent.objects.create(
         event_type=ModerationEvent.EventType.PRODUCT_APPROVED,
-        product_id=product_id,
+        product_id=card.product_id,
         published=True,
         payload={
             **b2b_payload,
@@ -137,4 +129,4 @@ def approve_product(product_id, moderator):
         },
     )
 
-    return {'product_id': str(product_id), 'status': 'MODERATED'}
+    return build_ticket_response(card)

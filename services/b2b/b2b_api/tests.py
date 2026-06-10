@@ -965,9 +965,11 @@ class B2BApiTests(TestCase):
         item = response.data['items'][0]
         self.assertEqual(item['id'], str(fixtures['visible_product'].id))
         self.assertEqual(item['status'], Product.Status.MODERATED)
-        self.assertFalse(item.get('deleted', False))
-        self.assertEqual(len(item['skus']), 1)
-        self.assertGreater(item['skus'][0]['active_quantity'], 0)
+        self.assertEqual(item['category_id'], str(fixtures['visible_product'].category_id))
+        self.assertIn('slug', item)
+        self.assertEqual(item['min_price'], fixtures['visible_sku'].price)
+        self.assertNotIn('skus', item)
+        self.assertNotIn('description', item)
 
         returned_ids = {row['id'] for row in response.data['items']}
         self.assertNotIn(str(fixtures['blocked_product'].id), returned_ids)
@@ -996,12 +998,27 @@ class B2BApiTests(TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.data['code'], 'UNAUTHORIZED')
 
-    def test_catalog_response_has_no_cost_price(self):
+    def test_batch_product_ids_returns_full_visible_products(self):
         fixtures = self._create_catalog_visibility_fixtures()
+        visible = fixtures['visible_product']
 
-        response = self.client.get('/api/v1/public/products?limit=10&offset=0', **self.service_headers)
+        response = self.client.post(
+            '/api/v1/public/products/batch',
+            {
+                'product_ids': [
+                    str(visible.id),
+                    str(fixtures['blocked_product'].id),
+                    str(fixtures['deleted_product'].id),
+                ],
+            },
+            format='json',
+            **self.service_headers,
+        )
         self.assertEqual(response.status_code, 200)
-        sku_payload = response.data['items'][0]['skus'][0]
+        self.assertEqual(len(response.data), 1)
+        item = response.data[0]
+        self.assertEqual(item['id'], str(visible.id))
+        sku_payload = item['skus'][0]
         self.assertEqual(sku_payload['id'], str(fixtures['visible_sku'].id))
         self.assertNotIn('cost_price', sku_payload)
         self.assertNotIn('reserved_quantity', sku_payload)

@@ -2,8 +2,8 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from django.db import transaction
-from .approve import ApproveError, approve_product
-from .decline import DeclineError, decline_product
+from .approve import ApproveError, approve_ticket
+from .decline import BlockError, block_ticket
 from .hard_block import HardBlockError
 from .soft_block import SoftBlockError
 from .terminal import assert_product_not_hard_blocked
@@ -19,11 +19,12 @@ from .models import BlockingReason, ModerationCard, ModerationEvent
 from .get_next import acquire_next_card
 from .product_events import apply_product_event
 from .serializers import (
+    BlockDecisionRequestSerializer,
     BlockingReasonSerializer,
-    DeclineRequestSerializer,
     EnqueueRequestSerializer,
     GetNextRequestSerializer,
     ModerationCardSerializer,
+    TicketResponseSerializer,
 )
 
 
@@ -120,8 +121,8 @@ class ModerationEnqueueView(APIView):
 
         product_id = serializer.validated_data['product_id']
         try:
-            assert_product_not_hard_blocked(product_id, DeclineError)
-        except DeclineError as exc:
+            assert_product_not_hard_blocked(product_id, BlockError)
+        except BlockError as exc:
             return _error(exc.message, exc.code, exc.http_status)
         snapshot_after = serializer.validated_data.get('snapshot_after') or {'id': str(product_id)}
         card = ModerationCard.objects.create(
@@ -139,18 +140,18 @@ class ModerationEnqueueView(APIView):
 
 
 @extend_schema_view(
-    post=extend_schema(operation_id='moderation_approve_product', responses=OpenApiTypes.OBJECT),
+    post=extend_schema(operation_id='moderation_approve_ticket', responses=TicketResponseSerializer),
 )
-class ProductApproveView(APIView):
-    serializer_class = ModerationCardSerializer
+class TicketApproveView(APIView):
+    serializer_class = TicketResponseSerializer
 
-    def post(self, request, id):
+    def post(self, request, ticket_id):
         auth_context, error = _authorize_moderator(request)
         if error:
             return error
 
         try:
-            result = approve_product(id, auth_context.actor)
+            result = approve_ticket(ticket_id, auth_context.actor)
         except ApproveError as exc:
             return _error(exc.message, exc.code, exc.http_status)
 
@@ -159,22 +160,22 @@ class ProductApproveView(APIView):
 
 @extend_schema_view(
     post=extend_schema(
-        operation_id='moderation_decline_product',
-        request=DeclineRequestSerializer,
-        responses=OpenApiTypes.OBJECT,
+        operation_id='moderation_block_ticket',
+        request=BlockDecisionRequestSerializer,
+        responses=TicketResponseSerializer,
     ),
 )
-class ProductDeclineView(APIView):
-    serializer_class = DeclineRequestSerializer
+class TicketBlockView(APIView):
+    serializer_class = BlockDecisionRequestSerializer
 
-    def post(self, request, id):
+    def post(self, request, ticket_id):
         auth_context, error = _authorize_moderator(request)
         if error:
             return error
 
-        serializer = DeclineRequestSerializer(data=request.data)
+        serializer = BlockDecisionRequestSerializer(data=request.data)
         if not serializer.is_valid():
-            return _error('Invalid decline payload', 'BAD_REQUEST', status.HTTP_400_BAD_REQUEST)
+            return _error('Invalid block payload', 'BAD_REQUEST', status.HTTP_400_BAD_REQUEST)
 
         legacy_fields = serializer.validated_data.get('fields') or []
         field_reports = serializer.validated_data.get('field_reports') or []
@@ -185,14 +186,14 @@ class ProductDeclineView(APIView):
             ]
 
         try:
-            result = decline_product(
-                id,
+            result = block_ticket(
+                ticket_id,
                 auth_context.actor,
-                serializer.validated_data['blocking_reason_id'],
+                serializer.validated_data['blocking_reason_ids'],
                 comment=serializer.validated_data.get('comment', ''),
                 field_reports=field_reports,
             )
-        except (DeclineError, SoftBlockError, HardBlockError) as exc:
+        except (BlockError, SoftBlockError, HardBlockError) as exc:
             return _error(exc.message, exc.code, exc.http_status)
 
         return Response(result)

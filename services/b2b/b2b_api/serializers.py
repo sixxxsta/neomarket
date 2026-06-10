@@ -168,6 +168,19 @@ class ProductSerializer(serializers.ModelSerializer):
         return data
 
 
+class ProductPublicShortSerializer(serializers.ModelSerializer):
+    category_id = serializers.UUIDField(source='category.id', read_only=True)
+    slug = serializers.SerializerMethodField()
+    min_price = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = Product
+        fields = ['id', 'title', 'slug', 'status', 'category_id', 'created_at', 'min_price']
+
+    def get_slug(self, obj):
+        return _product_slug(obj)
+
+
 class CatalogProductSerializer(serializers.ModelSerializer):
     category = CategorySerializer(read_only=True)
     skus = serializers.SerializerMethodField()

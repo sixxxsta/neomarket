@@ -105,7 +105,10 @@ def compute_priority_queue(product_id, event_type, snapshot_after):
         return 1
     if ModerationCard.objects.filter(
         product_id=product_id,
-        queue_status=ModerationCard.QueueStatus.DECLINED,
+        queue_status__in=[
+            ModerationCard.QueueStatus.BLOCKED,
+            ModerationCard.QueueStatus.DECLINED,
+        ],
     ).exists():
         return 2
     if _has_active_stock(snapshot_after):
