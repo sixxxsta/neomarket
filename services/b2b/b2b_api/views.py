@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 import jwt
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Count, F, Q, Sum
+from django.db.models import Count, F, Min, Q, Sum
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from jwt import InvalidTokenError
@@ -27,6 +27,7 @@ from .models import (
 from .serializers import (
     AcceptInvoiceRequestSerializer,
     CatalogProductSerializer,
+    ProductPublicShortSerializer,
     CreateInvoiceRequestSerializer,
     CreateProductRequestSerializer,
     CreateSkuRequestSerializer,
@@ -331,8 +332,8 @@ def _inventory_order_response(order_id, status_value, processed_at):
     }
 
 
-def _catalog_visible_queryset():
-    return (
+def _catalog_visible_queryset(*, with_skus=False):
+    queryset = (
         Product.objects.filter(
             status=Product.Status.MODERATED,
             deleted=False,
@@ -340,9 +341,17 @@ def _catalog_visible_queryset():
             skus__active_quantity__gt=0,
         )
         .select_related('category')
-        .prefetch_related('skus')
+        .annotate(
+            min_price=Min(
+                'skus__price',
+                filter=Q(skus__deleted=False, skus__active_quantity__gt=0),
+            )
+        )
         .distinct()
     )
+    if with_skus:
+        queryset = queryset.prefetch_related('skus')
+    return queryset
 
 
 def _annotated_seller_products_queryset(seller_id, *, include_deleted=False):
@@ -490,7 +499,7 @@ class ProductsView(APIView):
         except ValueError:
             return _error('BAD_REQUEST', 'Invalid pagination params', status.HTTP_400_BAD_REQUEST)
 
-        queryset = _catalog_visible_queryset()
+        queryset = _catalog_visible_queryset(with_skus=True)
 
         ids_param = request.query_params.get('ids')
         if ids_param:
@@ -506,6 +515,36 @@ class ProductsView(APIView):
         return Response(
             {
                 'items': CatalogProductSerializer(items, many=True).data,
+                'total_count': total,
+                'total': total,
+                'limit': limit,
+                'offset': offset,
+            }
+        )
+
+    def _public_catalog_list_view(self, request):
+        try:
+            limit = max(1, min(int(request.query_params.get('limit', 20)), 100))
+            offset = max(0, int(request.query_params.get('offset', 0)))
+        except ValueError:
+            return _error('BAD_REQUEST', 'Invalid pagination params', status.HTTP_400_BAD_REQUEST)
+
+        queryset = _catalog_visible_queryset()
+
+        ids_param = request.query_params.get('ids')
+        if ids_param:
+            raw_ids = [item.strip() for item in ids_param.split(',') if item.strip()]
+            parsed_ids = [_parse_uuid(item) for item in raw_ids]
+            if any(item is None for item in parsed_ids):
+                return _error('BAD_REQUEST', 'Invalid ids filter', status.HTTP_400_BAD_REQUEST)
+            queryset = queryset.filter(id__in=parsed_ids)
+
+        total = queryset.count()
+        items = queryset[offset : offset + limit]
+
+        return Response(
+            {
+                'items': ProductPublicShortSerializer(items, many=True).data,
                 'total_count': total,
                 'total': total,
                 'limit': limit,
@@ -1139,7 +1178,7 @@ class PublicProductListView(APIView):
         error = _require_service_key(request)
         if error:
             return error
-        return ProductsView()._catalog_view(request)
+        return ProductsView()._public_catalog_list_view(request)
 
 
 class PublicProductBatchView(APIView):
@@ -1147,13 +1186,20 @@ class PublicProductBatchView(APIView):
         error = _require_service_key(request)
         if error:
             return error
-        ids = request.data.get('ids') or []
-        if not isinstance(ids, list) or not ids:
-            return _error('BAD_REQUEST', 'ids must be a non-empty array', status.HTTP_400_BAD_REQUEST)
-        query = request._request.GET.copy()
-        query['ids'] = ','.join(str(item) for item in ids)
-        request._request.GET = query
-        return ProductsView()._catalog_view(request)
+        product_ids = request.data.get('product_ids') or []
+        if not isinstance(product_ids, list) or not product_ids:
+            return _error(
+                'BAD_REQUEST',
+                'product_ids must be a non-empty array',
+                status.HTTP_400_BAD_REQUEST,
+            )
+        parsed_ids = [_parse_uuid(item) for item in product_ids]
+        if any(item is None for item in parsed_ids):
+            return _error('BAD_REQUEST', 'Invalid product_ids', status.HTTP_400_BAD_REQUEST)
+
+        queryset = _catalog_visible_queryset(with_skus=True).filter(id__in=parsed_ids)
+        items = list(queryset)
+        return Response(CatalogProductSerializer(items, many=True).data)
 
 
 class PublicProductDetailView(APIView):

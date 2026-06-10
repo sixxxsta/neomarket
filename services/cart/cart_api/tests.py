@@ -369,9 +369,9 @@ class CartApiTests(TestCase):
 
         response = self.client.get("/api/v1/catalog/banners")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["total_count"], 2)
-        self.assertEqual([item["id"] for item in response.data["items"]], [str(first.id), str(second.id)])
-        self.assertEqual([item["priority"] for item in response.data["items"]], [10, 20])
+        self.assertEqual(len(response.data), 2)
+        self.assertEqual([item["id"] for item in response.data], [str(first.id), str(second.id)])
+        self.assertEqual([item["priority"] for item in response.data], [10, 20])
 
     def test_no_active_banners_returns_200_empty(self):
         Banner.objects.create(
@@ -384,8 +384,7 @@ class CartApiTests(TestCase):
 
         response = self.client.get("/api/v1/catalog/banners")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["items"], [])
-        self.assertEqual(response.data["total_count"], 0)
+        self.assertEqual(response.data, [])
 
     def test_click_on_unknown_banner_returns_400(self):
         response = self.client.post(

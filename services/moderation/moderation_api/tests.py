@@ -1,6 +1,6 @@
 from datetime import timedelta
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import json
 import jwt
@@ -11,6 +11,14 @@ from rest_framework.test import APIClient
 
 from .models import BlockingReason, ModerationCard, ModerationEvent
 from .queue import enqueue_from_event, parse_event
+
+
+def blocking_reason_uuid(code):
+    return str(BlockingReason.objects.get(code=code).reason_uuid)
+
+
+def expected_idempotency_key(card_id, action):
+    return str(uuid5(NAMESPACE_URL, f'moderation:{action}:{card_id}'))
 
 
 def build_test_token(moderator_id=None):
@@ -31,7 +39,7 @@ class ModerationApiTests(TestCase):
         token = build_test_token()
         self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {token}')
 
-    @patch('moderation_api.approve.post_moderation_decision', return_value=((200, {}), None))
+    @patch('moderation_api.b2b_client.post_moderation_decision', return_value=((200, {}), None))
     def test_get_next_and_approve(self, _mock_b2b):
         product_id = str(uuid4())
         sku_id = str(uuid4())
@@ -56,12 +64,13 @@ class ModerationApiTests(TestCase):
         self.assertEqual(next_card.status_code, 200)
         self.assertEqual(next_card.data['product_id'], product_id)
 
-        approve = self.client.post(f'/api/v1/products/{product_id}/approve', {}, format='json')
+        ticket_id = next_card.data['id']
+        approve = self.client.post(f'/api/v1/tickets/{ticket_id}/approve', {}, format='json')
         self.assertEqual(approve.status_code, 200)
-        self.assertEqual(approve.data['status'], 'MODERATED')
+        self.assertEqual(approve.data['status'], 'APPROVED')
         event = ModerationEvent.objects.get(product_id=product_id)
         self.assertEqual(event.event_type, ModerationEvent.EventType.PRODUCT_APPROVED)
-        self.assertTrue(event.payload['idempotency_key'].startswith('approve:'))
+        UUID(event.payload['idempotency_key'])
         _mock_b2b.assert_called_once()
 
     def test_parse_event_product_id_from_aggregate_id(self):
@@ -86,7 +95,7 @@ class ModerationApiTests(TestCase):
     def test_decline_requires_reason(self):
         product_id = str(uuid4())
         moderator_id = uuid4()
-        ModerationCard.objects.create(
+        card = ModerationCard.objects.create(
             product_id=product_id,
             event_type='UPDATED',
             queue_status=ModerationCard.QueueStatus.IN_REVIEW,
@@ -97,8 +106,8 @@ class ModerationApiTests(TestCase):
         client = APIClient()
         client.credentials(HTTP_AUTHORIZATION=f'Bearer {build_test_token(moderator_id)}')
         decline = client.post(
-            f'/api/v1/products/{product_id}/decline',
-            {'blocking_reason_id': 'UNKNOWN'},
+            f'/api/v1/tickets/{card.id}/block',
+            {'blocking_reason_ids': [str(uuid4())]},
             format='json',
         )
         self.assertEqual(decline.status_code, 400)
@@ -153,7 +162,7 @@ class ModerationApiTests(TestCase):
 
     def test_approve_requires_in_review_card(self):
         product_id = str(uuid4())
-        ModerationCard.objects.create(
+        card = ModerationCard.objects.create(
             product_id=product_id,
             event_type='CREATED',
             queue_status=ModerationCard.QueueStatus.PENDING,
@@ -164,7 +173,7 @@ class ModerationApiTests(TestCase):
             },
         )
 
-        approve = self.client.post(f'/api/v1/products/{product_id}/approve', {}, format='json')
+        approve = self.client.post(f'/api/v1/tickets/{card.id}/approve', {}, format='json')
         self.assertEqual(approve.status_code, 404)
 
 
@@ -392,6 +401,7 @@ class ApproveProductApiTests(TestCase):
             snapshot_after=snapshot
             or {
                 'id': str(product_id),
+                'seller_id': str(uuid4()),
                 'status': 'ON_MODERATION',
                 'skus': [{'id': str(uuid4()), 'deleted': False}],
             },
@@ -400,14 +410,15 @@ class ApproveProductApiTests(TestCase):
         card.refresh_from_db()
         return card, moderator_id
 
-    @patch('moderation_api.approve.post_moderation_decision', return_value=((200, {}), None))
+    @patch('moderation_api.b2b_client.post_moderation_decision', return_value=((200, {}), None))
     def test_approve_transitions_to_moderated_and_emits_event(self, mock_b2b):
         card, moderator_id = self._in_review_card()
         client = self._client_for(moderator_id)
 
-        response = client.post(f'/api/v1/products/{card.product_id}/approve', {}, format='json')
+        response = client.post(f'/api/v1/tickets/{card.id}/approve', {}, format='json')
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data['status'], 'MODERATED')
+        self.assertEqual(response.data['status'], 'APPROVED')
+        self.assertEqual(response.data['id'], str(card.id))
 
         card.refresh_from_db()
         self.assertEqual(card.queue_status, ModerationCard.QueueStatus.APPROVED)
@@ -416,7 +427,10 @@ class ApproveProductApiTests(TestCase):
         self.assertEqual(event.event_type, ModerationEvent.EventType.PRODUCT_APPROVED)
         self.assertTrue(event.published)
         self.assertEqual(event.payload['event_type'], 'MODERATED')
-        self.assertEqual(event.payload['idempotency_key'], f'approve:{card.id}')
+        self.assertEqual(
+            event.payload['idempotency_key'],
+            expected_idempotency_key(card.id, 'approve'),
+        )
 
         mock_b2b.assert_called_once()
         payload = mock_b2b.call_args[0][0]
@@ -430,7 +444,7 @@ class ApproveProductApiTests(TestCase):
         card, _ = self._in_review_card(moderator_id=owner)
         client = self._client_for(intruder)
 
-        response = client.post(f'/api/v1/products/{card.product_id}/approve', {}, format='json')
+        response = client.post(f'/api/v1/tickets/{card.id}/approve', {}, format='json')
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.data['code'], 'APPROVE_NOT_ASSIGNED')
         card.refresh_from_db()
@@ -456,7 +470,7 @@ class ApproveProductApiTests(TestCase):
         card.refresh_from_db()
         self.assertGreater(card.updated_at, card.review_started_at)
 
-        response = client.post(f'/api/v1/products/{card.product_id}/approve', {}, format='json')
+        response = client.post(f'/api/v1/tickets/{card.id}/approve', {}, format='json')
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.data['code'], 'APPROVE_AFTER_EDITED')
 
@@ -472,7 +486,7 @@ class ApproveProductApiTests(TestCase):
         )
         client = self._client_for(moderator_id)
 
-        response = client.post(f'/api/v1/products/{card.product_id}/approve', {}, format='json')
+        response = client.post(f'/api/v1/tickets/{card.id}/approve', {}, format='json')
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.data['code'], 'APPROVE_WITHOUT_SKU')
 
@@ -495,6 +509,7 @@ class SoftBlockApiTests(TestCase):
             review_started_at=now,
             snapshot_after={
                 'id': str(product_id),
+                'seller_id': str(uuid4()),
                 'status': 'ON_MODERATION',
                 'skus': [{'id': str(uuid4()), 'deleted': False}],
             },
@@ -505,7 +520,7 @@ class SoftBlockApiTests(TestCase):
 
     def _decline_payload(self, reason_code='BAD_MEDIA', **extra):
         payload = {
-            'blocking_reason_id': reason_code,
+            'blocking_reason_ids': [blocking_reason_uuid(reason_code)],
             'comment': 'Fix photos',
             'field_reports': [
                 {'field_name': 'product_images', 'comment': 'Blurry photos'},
@@ -515,23 +530,22 @@ class SoftBlockApiTests(TestCase):
         payload.update(extra)
         return payload
 
-    @patch('moderation_api.soft_block.post_moderation_decision', return_value=((200, {}), None))
+    @patch('moderation_api.b2b_client.post_moderation_decision', return_value=((200, {}), None))
     def test_soft_block_transitions_to_blocked_with_field_reports(self, mock_b2b):
         card, moderator_id = self._in_review_card()
         client = self._client_for(moderator_id)
 
         response = client.post(
-            f'/api/v1/products/{card.product_id}/decline',
+            f'/api/v1/tickets/{card.id}/block',
             self._decline_payload(),
             format='json',
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['status'], 'BLOCKED')
-        self.assertFalse(response.data['hard_block'])
-        self.assertEqual(len(response.data['field_reports']), 2)
+        self.assertEqual(response.data['id'], str(card.id))
 
         card.refresh_from_db()
-        self.assertEqual(card.queue_status, ModerationCard.QueueStatus.DECLINED)
+        self.assertEqual(card.queue_status, ModerationCard.QueueStatus.BLOCKED)
         self.assertEqual(card.decline_reason.code, 'BAD_MEDIA')
 
         event = ModerationEvent.objects.get(product_id=card.product_id)
@@ -539,18 +553,21 @@ class SoftBlockApiTests(TestCase):
         self.assertEqual(event.payload['hard_block'], False)
         mock_b2b.assert_called_once()
 
-    @patch('moderation_api.soft_block.post_moderation_decision', return_value=((200, {}), None))
+    @patch('moderation_api.b2b_client.post_moderation_decision', return_value=((200, {}), None))
     def test_soft_block_emits_event_to_b2b(self, mock_b2b):
         card, moderator_id = self._in_review_card()
         client = self._client_for(moderator_id)
 
-        client.post(f'/api/v1/products/{card.product_id}/decline', self._decline_payload(), format='json')
+        client.post(f'/api/v1/tickets/{card.id}/block', self._decline_payload(), format='json')
 
         payload = mock_b2b.call_args[0][0]
         self.assertEqual(payload['event_type'], 'BLOCKED')
         self.assertFalse(payload['hard_block'])
-        self.assertEqual(payload['idempotency_key'], f'soft-block:{card.id}')
-        self.assertEqual(payload['blocking_reason_id'], 'BAD_MEDIA')
+        self.assertEqual(
+            payload['idempotency_key'],
+            expected_idempotency_key(card.id, 'soft-block'),
+        )
+        self.assertEqual(payload['blocking_reason_id'], blocking_reason_uuid('BAD_MEDIA'))
         self.assertEqual(payload['field_reports'][0]['field_name'], 'product_images')
         self.assertEqual(payload['field_reports'][0]['comment'], 'Blurry photos')
 
@@ -559,8 +576,8 @@ class SoftBlockApiTests(TestCase):
         client = self._client_for(moderator_id)
 
         response = client.post(
-            f'/api/v1/products/{card.product_id}/decline',
-            self._decline_payload(reason_code='DOES_NOT_EXIST'),
+            f'/api/v1/tickets/{card.id}/block',
+            {'blocking_reason_ids': [str(uuid4())]},
             format='json',
         )
         self.assertEqual(response.status_code, 400)
@@ -573,7 +590,7 @@ class SoftBlockApiTests(TestCase):
         client = self._client_for(intruder)
 
         response = client.post(
-            f'/api/v1/products/{card.product_id}/decline',
+            f'/api/v1/tickets/{card.id}/block',
             self._decline_payload(),
             format='json',
         )
@@ -586,7 +603,7 @@ class SoftBlockApiTests(TestCase):
         payload = self._decline_payload()
         payload['field_reports'] = [{'field_name': 'unknown_field', 'comment': 'Bad'}]
 
-        response = client.post(f'/api/v1/products/{card.product_id}/decline', payload, format='json')
+        response = client.post(f'/api/v1/tickets/{card.id}/block', payload, format='json')
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.data['code'], 'INVALID_FIELD_NAME')
 
@@ -594,17 +611,16 @@ class SoftBlockApiTests(TestCase):
         card, moderator_id = self._in_review_card()
         client = self._client_for(moderator_id)
 
-        with patch('moderation_api.soft_block.post_moderation_decision', return_value=((200, {}), None)):
+        with patch('moderation_api.b2b_client.post_moderation_decision', return_value=((200, {}), None)):
             response = client.post(
-                f'/api/v1/products/{card.product_id}/decline',
+                f'/api/v1/tickets/{card.id}/block',
                 self._decline_payload(reason_code='BAD_MEDIA'),
                 format='json',
             )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['status'], 'BLOCKED')
-        self.assertFalse(response.data['hard_block'])
         card.refresh_from_db()
-        self.assertEqual(card.queue_status, ModerationCard.QueueStatus.DECLINED)
+        self.assertEqual(card.queue_status, ModerationCard.QueueStatus.BLOCKED)
 
 
 class HardBlockApiTests(TestCase):
@@ -635,26 +651,26 @@ class HardBlockApiTests(TestCase):
 
     def _hard_decline_payload(self, **extra):
         payload = {
-            'blocking_reason_id': 'FORBIDDEN_CONTENT',
+            'blocking_reason_ids': [blocking_reason_uuid('FORBIDDEN_CONTENT')],
             'comment': 'Counterfeit listing',
             'field_reports': [{'field_name': 'title', 'comment': 'Prohibited item'}],
         }
         payload.update(extra)
         return payload
 
-    @patch('moderation_api.hard_block.post_moderation_decision', return_value=((200, {}), None))
+    @patch('moderation_api.b2b_client.post_moderation_decision', return_value=((200, {}), None))
     def test_hard_block_transitions_to_terminal_and_emits_event(self, mock_b2b):
         card, moderator_id = self._in_review_card()
         client = self._client_for(moderator_id)
 
         response = client.post(
-            f'/api/v1/products/{card.product_id}/decline',
+            f'/api/v1/tickets/{card.id}/block',
             self._hard_decline_payload(),
             format='json',
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['status'], 'HARD_BLOCKED')
-        self.assertTrue(response.data['hard_block'])
+        self.assertEqual(response.data['id'], str(card.id))
 
         card.refresh_from_db()
         self.assertEqual(card.queue_status, ModerationCard.QueueStatus.HARD_BLOCKED)
@@ -664,18 +680,21 @@ class HardBlockApiTests(TestCase):
         self.assertTrue(event.published)
         mock_b2b.assert_called_once()
 
-    @patch('moderation_api.hard_block.post_moderation_decision', return_value=((200, {}), None))
+    @patch('moderation_api.b2b_client.post_moderation_decision', return_value=((200, {}), None))
     def test_hard_block_event_carries_hard_block_true(self, mock_b2b):
         card, moderator_id = self._in_review_card()
         client = self._client_for(moderator_id)
 
-        client.post(f'/api/v1/products/{card.product_id}/decline', self._hard_decline_payload(), format='json')
+        client.post(f'/api/v1/tickets/{card.id}/block', self._hard_decline_payload(), format='json')
 
         payload = mock_b2b.call_args[0][0]
         self.assertEqual(payload['event_type'], 'BLOCKED')
         self.assertTrue(payload['hard_block'])
-        self.assertEqual(payload['idempotency_key'], f'hard-block:{card.id}')
-        self.assertEqual(payload['blocking_reason_id'], 'FORBIDDEN_CONTENT')
+        self.assertEqual(
+            payload['idempotency_key'],
+            expected_idempotency_key(card.id, 'hard-block'),
+        )
+        self.assertEqual(payload['blocking_reason_id'], blocking_reason_uuid('FORBIDDEN_CONTENT'))
 
     def test_any_modify_on_hard_blocked_returns_403(self):
         card, moderator_id = self._in_review_card()
@@ -687,12 +706,12 @@ class HardBlockApiTests(TestCase):
             review_started_at=None,
         )
 
-        approve = client.post(f'/api/v1/products/{card.product_id}/approve', {}, format='json')
+        approve = client.post(f'/api/v1/tickets/{card.id}/approve', {}, format='json')
         self.assertEqual(approve.status_code, 403)
         self.assertEqual(approve.data['code'], 'HARD_BLOCKED_TERMINAL')
 
         decline = client.post(
-            f'/api/v1/products/{card.product_id}/decline',
+            f'/api/v1/tickets/{card.id}/block',
             self._hard_decline_payload(),
             format='json',
         )
@@ -826,7 +845,7 @@ class BlockingReasonsApiTests(TestCase):
         ModerationCard.objects.create(
             product_id=uuid4(),
             event_type=ModerationCard.EventType.CREATED,
-            queue_status=ModerationCard.QueueStatus.DECLINED,
+            queue_status=ModerationCard.QueueStatus.BLOCKED,
             decline_reason=reason,
             snapshot_after={'id': str(uuid4()), 'status': 'BLOCKED'},
         )

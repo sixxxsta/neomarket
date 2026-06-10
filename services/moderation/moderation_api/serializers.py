@@ -30,21 +30,28 @@ class ModerationCardSerializer(serializers.ModelSerializer):
         ]
 
 
-class DeclineRequestSerializer(serializers.Serializer):
-    blocking_reason_id = serializers.SlugField(max_length=64, required=False)
-    reason_code = serializers.SlugField(max_length=64, required=False)
+class TicketResponseSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    product_id = serializers.UUIDField()
+    seller_id = serializers.UUIDField(allow_null=True)
+    kind = serializers.CharField()
+    status = serializers.CharField()
+    queue_priority = serializers.IntegerField()
+    created_at = serializers.DateTimeField()
+
+
+class BlockDecisionRequestSerializer(serializers.Serializer):
+    blocking_reason_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        min_length=1,
+        required=True,
+    )
     comment = serializers.CharField(max_length=500, allow_blank=True, required=False, default='')
     field_reports = FieldReportItemSerializer(many=True, required=False, allow_empty=True)
     fields = serializers.ListField(child=serializers.CharField(max_length=128), required=False, allow_empty=True)
 
-    def validate(self, attrs):
-        reason_id = attrs.get('blocking_reason_id') or attrs.get('reason_code')
-        if not reason_id:
-            raise serializers.ValidationError(
-                {'blocking_reason_id': 'blocking_reason_id or reason_code is required'}
-            )
-        attrs['blocking_reason_id'] = reason_id
-        return attrs
+
+DeclineRequestSerializer = BlockDecisionRequestSerializer
 
 
 class GetNextRequestSerializer(serializers.Serializer):

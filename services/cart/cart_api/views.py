@@ -880,7 +880,7 @@ class HomeBannersView(APIView):
             }
             for banner in queryset
         ]
-        return Response({"items": items, "total_count": len(items)})
+        return Response(items)
 
 
 @extend_schema_view(
