@@ -17,7 +17,7 @@ class ModerationContractTests(TestCase):
             '/api/v1/product-moderation/enqueue',
             '/api/v1/tickets/{ticket_id}/approve',
             '/api/v1/tickets/{ticket_id}/block',
-            '/api/v1/product-blocking-reasons',
+            '/api/v1/blocking-reasons',
         ]
 
         for path in expected_paths:
