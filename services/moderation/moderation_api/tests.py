@@ -419,6 +419,7 @@ class ApproveProductApiTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['status'], 'APPROVED')
         self.assertEqual(response.data['id'], str(card.id))
+        self.assertEqual(response.data['kind'], 'CREATE')
 
         card.refresh_from_db()
         self.assertEqual(card.queue_status, ModerationCard.QueueStatus.APPROVED)
@@ -523,8 +524,8 @@ class SoftBlockApiTests(TestCase):
             'blocking_reason_ids': [blocking_reason_uuid(reason_code)],
             'comment': 'Fix photos',
             'field_reports': [
-                {'field_name': 'product_images', 'comment': 'Blurry photos'},
-                {'field_name': 'description', 'comment': 'Add size chart'},
+                {'field_path': 'product_images', 'message': 'Blurry photos'},
+                {'field_path': 'description', 'message': 'Add size chart'},
             ],
         }
         payload.update(extra)
@@ -601,7 +602,7 @@ class SoftBlockApiTests(TestCase):
         card, moderator_id = self._in_review_card()
         client = self._client_for(moderator_id)
         payload = self._decline_payload()
-        payload['field_reports'] = [{'field_name': 'unknown_field', 'comment': 'Bad'}]
+        payload['field_reports'] = [{'field_path': 'unknown_field', 'message': 'Bad'}]
 
         response = client.post(f'/api/v1/tickets/{card.id}/block', payload, format='json')
         self.assertEqual(response.status_code, 400)
@@ -653,7 +654,7 @@ class HardBlockApiTests(TestCase):
         payload = {
             'blocking_reason_ids': [blocking_reason_uuid('FORBIDDEN_CONTENT')],
             'comment': 'Counterfeit listing',
-            'field_reports': [{'field_name': 'title', 'comment': 'Prohibited item'}],
+            'field_reports': [{'field_path': 'title', 'message': 'Prohibited item'}],
         }
         payload.update(extra)
         return payload
@@ -802,18 +803,20 @@ class BlockingReasonsApiTests(TestCase):
         self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {build_test_token()}')
 
     def test_list_returns_active_reasons(self):
-        response = self.client.get('/api/v1/product-blocking-reasons')
+        response = self.client.get('/api/v1/blocking-reasons')
         self.assertEqual(response.status_code, 200)
 
-        codes = {item['blocking_reason_id'] for item in response.data}
+        codes = {item['code'] for item in response.data}
         self.assertIn('BAD_MEDIA', codes)
         self.assertIn('FORBIDDEN_CONTENT', codes)
 
-        bad_media = next(item for item in response.data if item['blocking_reason_id'] == 'BAD_MEDIA')
+        bad_media = next(item for item in response.data if item['code'] == 'BAD_MEDIA')
         self.assertEqual(bad_media['title'], 'Некачественные фото')
         self.assertFalse(bad_media['hard_block'])
+        self.assertTrue(bad_media['is_active'])
+        self.assertIn('id', bad_media)
 
-        forbidden = next(item for item in response.data if item['blocking_reason_id'] == 'FORBIDDEN_CONTENT')
+        forbidden = next(item for item in response.data if item['code'] == 'FORBIDDEN_CONTENT')
         self.assertTrue(forbidden['hard_block'])
 
     def test_inactive_reasons_not_visible(self):
@@ -824,21 +827,21 @@ class BlockingReasonsApiTests(TestCase):
             hard_only=False,
         )
 
-        response = self.client.get('/api/v1/product-blocking-reasons')
+        response = self.client.get('/api/v1/blocking-reasons')
         self.assertEqual(response.status_code, 200)
-        codes = {item['blocking_reason_id'] for item in response.data}
+        codes = {item['code'] for item in response.data}
         self.assertNotIn('RETIRED_REASON', codes)
 
     def test_list_filters_by_hard_block(self):
-        soft = self.client.get('/api/v1/product-blocking-reasons', {'hard_block': 'false'})
-        hard = self.client.get('/api/v1/product-blocking-reasons', {'hard_block': 'true'})
+        soft = self.client.get('/api/v1/blocking-reasons', {'hard_block': 'false'})
+        hard = self.client.get('/api/v1/blocking-reasons', {'hard_block': 'true'})
 
         self.assertEqual(soft.status_code, 200)
         self.assertEqual(hard.status_code, 200)
         self.assertTrue(all(not item['hard_block'] for item in soft.data))
         self.assertTrue(all(item['hard_block'] for item in hard.data))
-        self.assertIn('FORBIDDEN_CONTENT', {item['blocking_reason_id'] for item in hard.data})
-        self.assertNotIn('FORBIDDEN_CONTENT', {item['blocking_reason_id'] for item in soft.data})
+        self.assertIn('FORBIDDEN_CONTENT', {item['code'] for item in hard.data})
+        self.assertNotIn('FORBIDDEN_CONTENT', {item['code'] for item in soft.data})
 
     def test_referenced_reason_cannot_be_deleted(self):
         reason = BlockingReason.objects.get(code='BAD_MEDIA')

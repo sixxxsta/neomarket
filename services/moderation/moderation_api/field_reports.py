@@ -23,8 +23,8 @@ FIELD_ALIASES = {
 
 
 class FieldReportItemSerializer(serializers.Serializer):
-    field_name = serializers.CharField(max_length=64)
-    comment = serializers.CharField(max_length=500, allow_blank=True, required=False, default='')
+    field_path = serializers.CharField(max_length=64)
+    message = serializers.CharField(max_length=500, allow_blank=True, required=False, default='')
     sku_id = serializers.UUIDField(required=False, allow_null=True)
 
 
@@ -45,8 +45,10 @@ def normalize_field_reports(field_reports, error_cls=None):
     for item in field_reports or []:
         if not isinstance(item, dict):
             continue
-        field_name = _canonical_field_name(item.get('field_name') or item.get('field'))
-        comment = str(item.get('comment') or item.get('message') or '').strip()
+        field_name = _canonical_field_name(
+            item.get('field_path') or item.get('field_name') or item.get('field')
+        )
+        comment = str(item.get('message') or item.get('comment') or '').strip()
         sku_id = item.get('sku_id')
         if not field_name:
             continue

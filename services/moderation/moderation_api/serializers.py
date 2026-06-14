@@ -5,12 +5,13 @@ from .models import BlockingReason, ModerationCard
 
 
 class BlockingReasonSerializer(serializers.ModelSerializer):
-    blocking_reason_id = serializers.SlugField(source='code', read_only=True)
+    id = serializers.UUIDField(source='reason_uuid', read_only=True)
+    code = serializers.SlugField(read_only=True)
     hard_block = serializers.BooleanField(source='hard_only', read_only=True)
 
     class Meta:
         model = BlockingReason
-        fields = ['blocking_reason_id', 'title', 'description', 'hard_block']
+        fields = ['id', 'code', 'title', 'hard_block', 'is_active']
 
 
 class ModerationCardSerializer(serializers.ModelSerializer):

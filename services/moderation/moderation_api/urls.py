@@ -21,6 +21,6 @@ urlpatterns = [
     path('tickets/<uuid:ticket_id>/approve/', TicketApproveView.as_view(), name='moderation-ticket-approve'),
     path('tickets/<uuid:ticket_id>/block', TicketBlockView.as_view(), name='moderation-ticket-block-no-slash'),
     path('tickets/<uuid:ticket_id>/block/', TicketBlockView.as_view(), name='moderation-ticket-block'),
-    path('product-blocking-reasons', BlockingReasonsView.as_view(), name='moderation-reasons-no-slash'),
-    path('product-blocking-reasons/', BlockingReasonsView.as_view(), name='moderation-reasons'),
+    path('blocking-reasons', BlockingReasonsView.as_view(), name='moderation-reasons-no-slash'),
+    path('blocking-reasons/', BlockingReasonsView.as_view(), name='moderation-reasons'),
 ]

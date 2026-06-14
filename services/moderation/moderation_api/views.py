@@ -181,7 +181,7 @@ class TicketBlockView(APIView):
         field_reports = serializer.validated_data.get('field_reports') or []
         if not field_reports and legacy_fields:
             field_reports = [
-                {'field_name': field_name, 'message': serializer.validated_data.get('comment', '')}
+                {'field_path': field_name, 'message': serializer.validated_data.get('comment', '')}
                 for field_name in legacy_fields
             ]
 
